@@ -50,7 +50,7 @@ const getConnectedClient = async (uri) => {
 export const withDatabase = async (uri, callback) => {
   try {
     const activeClient = await getConnectedClient(uri);
-    const db = activeClient.db("Kondaas");
+    const db = activeClient.db("kondaas_dev");
     
     return await callback(db);
     
