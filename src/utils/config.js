@@ -2,8 +2,8 @@ import { MongoClient, Binary, ObjectId } from 'mongodb';
 
 export { Binary, ObjectId };
 
-let cachedClient = null;
-
+let client = null;
+let clientPromise = null;
 
 export const getSystemKeys = async (db) => {
   const config = await db.collection("config").findOne({ _id: "system_keys" });
@@ -13,28 +13,60 @@ export const getSystemKeys = async (db) => {
   return config;
 };
 
+const getConnectedClient = async (uri) => {
+  // 1. Return active client if already connected and ready
+  if (client) {
+    return client;
+  }
+
+  // 2. If a connection is not already in progress, initialize the promise
+  if (!clientPromise) {
+    console.log("🐘 AWS: Initializing Persistent MongoDB Connection Pool...");
+    const newClient = new MongoClient(uri, {
+      maxPoolSize: 10,
+      minPoolSize: 2,
+      // Recommended for stable Atlas connections on AWS/Docker
+      connectTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+      serverSelectionTimeoutMS: 5000,
+    });
+
+    // Store the PROMISE so simultaneous calls wait for the exact same connection
+    clientPromise = newClient.connect().then((connectedClient) => {
+      client = connectedClient;
+      return client;
+    }).catch((err) => {
+      // Reset if connection totally fails so subsequent requests can try again
+      client = null;
+      clientPromise = null;
+      throw err;
+    });
+  }
+
+  // 3. Return the resolving promise
+  return clientPromise;
+};
 
 export const withDatabase = async (uri, callback) => {
   try {
-    if (!cachedClient) {
-      console.log("🐘 AWS: Using Persistent Connection Pool");
-      cachedClient = new MongoClient(uri, {
-        maxPoolSize: 10,
-        minPoolSize: 2,
-        // Recommended for stable Atlas connections on EC2
-        connectTimeoutMS: 5000,
-        socketTimeoutMS: 45000, 
-      });
-      await cachedClient.connect();
-    }
-
-    const db = cachedClient.db("Kondaas");
+    const activeClient = await getConnectedClient(uri);
+    const db = activeClient.db("Kondaas");
+    
     return await callback(db);
     
   } catch (error) {
-    console.error("❌ MongoDB Connection Error:", error);
-    // Reset so the next request tries a fresh connection
-    cachedClient = null; 
+    // If the connection pool drops or disconnects, safely clear the cache
+    if (
+      error.name === 'MongoTopologyClosedError' ||
+      error.name === 'MongoServerSelectionError' ||
+      error.name === 'MongoNetworkError'
+    ) {
+      console.warn("⚠️ Resetting MongoDB connection pool cache after network/topology error...");
+      client = null;
+      clientPromise = null;
+    }
+    
+    console.error("❌ MongoDB Operation Error:", error.message);
     throw error;
   }
 };
