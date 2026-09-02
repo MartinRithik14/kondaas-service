@@ -1,4 +1,3 @@
-import os from 'os';
 import puppeteer from 'puppeteer';
 
 export const generatePDF = async (htmlContent, outputPath) => {
