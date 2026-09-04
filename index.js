@@ -5,29 +5,34 @@ import { serve } from '@hono/node-server';
 import { startQueueRunner } from './src/controllers/queueEngine.js';
 import admin from 'firebase-admin';
 import fs from 'fs';
+import path from 'path';
 
-// 🔑 SAFE SERVICE ACCOUNT FALLBACK DETECTOR
-let firebaseCredential;
+const localKeyPath = path.join(process.cwd(), 'firebase-key.json');
+const dockerKeyPath = '/app/firebase-key.json';
 
-try {
-  if (fs.existsSync('/app/firebase-key.json')) {
-    const rawKey = fs.readFileSync('/app/firebase-key.json', 'utf8');
-    firebaseCredential = admin.credential.cert(JSON.parse(rawKey));
-    console.log("🔑 Initializing Firebase with Direct Service Account Key File.");
-  } else {
-    firebaseCredential = admin.credential.applicationDefault();
-    console.log("☁️ Initializing Firebase with default Workload Identity Federation.");
-  }
-} catch (err) {
-  console.error("⚠️ Error parsing firebase-key.json, falling back to applicationDefault:", err.message);
-  firebaseCredential = admin.credential.applicationDefault();
+let keyPath = null;
+if (fs.existsSync(localKeyPath)) {
+  keyPath = localKeyPath;
+} else if (fs.existsSync(dockerKeyPath)) {
+  keyPath = dockerKeyPath;
 }
 
-// 🎯 Explicitly passing projectId to ensure Workload Identity targets the correct resource scope
-admin.initializeApp({
-  credential: firebaseCredential,
-  projectId: 'kondaas-5dfaa'
-});
+try {
+  if (keyPath) {
+    const serviceAccount = JSON.parse(fs.readFileSync(keyPath, 'utf8'));
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log(`🔥 Firebase Admin initialized successfully using: ${keyPath}`);
+  } else {
+    console.warn("⚠️ Warning: firebase-key.json not found locally or in /app/. Falling back to applicationDefault()");
+    admin.initializeApp({
+      credential: admin.credential.applicationDefault()
+    });
+  }
+} catch (error) {
+  console.error("❌ Failed to initialize Firebase Admin SDK:", error.message);
+}
 
 import locationRoutes from './src/routes/locationRoutes.js';
 import logisticRoutes from './src/routes/logisticRoutes.js';
