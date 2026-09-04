@@ -1,6 +1,6 @@
     import { Hono } from 'hono';
 
-    import { addLocation, getLocationByTime,getMyDispatches,updateDispatchOrPackageStatus,getCurrentLocation,createLogisticsProduct,logLogisticsCompletion,updateProductStatus,updateLogisticsStatus,getLogisticsDealsByMobile,rejectLogisticsDeal,handleDispatchWebhook } from '../controllers/logisticController.js';
+    import { addLocation, getLocationByTime,getMyDispatches,updateDispatchOrPackageStatus,getCurrentLocation,createLogisticsProduct,logLogisticsCompletion,updateProductStatus,updateLogisticsStatus,getLogisticsDealsByMobile,rejectLogisticsDeal,handleDispatchWebhook,uploadPackageDeliveryPhotos } from '../controllers/logisticController.js';
 
     const logisticRoutes = new Hono();
 
@@ -23,6 +23,6 @@
     logisticRoutes.get('/my-dispatches', getMyDispatches);
 
     logisticRoutes.put('/update-shipment', updateDispatchOrPackageStatus);
-
+    logisticRoutes.post('/upload-package-photos', uploadPackageDeliveryPhotos);
 
     export default logisticRoutes;

@@ -1,5 +1,8 @@
 import { withDatabase } from '../utils/config.js'; 
+import fs from 'fs';
+import path from 'path';
 import { getZohoAccessToken } from '../utils/zohoAuth.js';
+import { uploadToZohoWorkDrive, getOrCreateLeadsSEFolder } from '../utils/uploadToZohoWorkDrive.js';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
@@ -726,5 +729,144 @@ export const updateDispatchOrPackageStatus = async (c) => {
   } catch (err) {
     console.error("❌ Update Error:", err.message);
     return c.json({ error: "Internal server error", details: err.message }, 500);
+  }
+};
+
+
+
+
+export const uploadPackageDeliveryPhotos = async (c) => {
+  const tempFilePaths = [];
+
+  try {
+    // 1. Parse Multipart Form Data (Photos + Metadata)
+    const body = await c.req.parseBody();
+    const deal_id = body['deal_id'] || body['crm_deal_id'];
+    const package_number = body['package_number'];
+    const dispatch_number = body['dispatch_number']; // Optional: helps locate doc faster in Mongo
+    const state = body['state'] || 'Default';
+
+    if (!deal_id || !package_number) {
+      return c.json({
+        error: "Validation Error: 'deal_id' and 'package_number' are required fields."
+      }, 400);
+    }
+
+    // Collect uploaded photo files (supports single or multiple file fields)
+    const files = [];
+    for (const key of Object.keys(body)) {
+      const val = body[key];
+      // Hono / standard file buffer check
+      if (val && typeof val === 'object' && (val.arrayBuffer || val instanceof Blob || val.name)) {
+        files.push(val);
+      }
+    }
+
+    if (files.length === 0) {
+      return c.json({ error: "Validation Error: No photo files found in the request." }, 400);
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      const zohoToken = await getZohoAccessToken(db);
+
+      // 2. Resolve / Create the "Package" subfolder under the Deal ID in WorkDrive
+      console.log(`📁 Resolving WorkDrive "Package" folder for Deal ID [${deal_id}] in [${state}]...`);
+      const targetPackageFolderId = await getOrCreateLeadsSEFolder(deal_id, "Package", state);
+
+      const uploadedFilesResults = [];
+
+      // 3. Write each file to temp disk, upload to WorkDrive, and cleanup
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const originalName = file.name || `delivery_${Date.now()}_${i + 1}.jpg`;
+        const sanitizedExt = path.extname(originalName) || '.jpg';
+        const fileName = `${package_number}_delivery_${Date.now()}_${i + 1}${sanitizedExt}`;
+        const tempPath = path.join(process.cwd(), fileName);
+
+        tempFilePaths.push(tempPath);
+
+        // Convert Blob/File to local Buffer
+        const arrayBuffer = await file.arrayBuffer();
+        await fs.promises.writeFile(tempPath, Buffer.from(arrayBuffer));
+
+        console.log(`⬆️ Uploading ${fileName} to WorkDrive folder [${targetPackageFolderId}]...`);
+        const uploadResult = await uploadToZohoWorkDrive(tempPath, fileName, targetPackageFolderId);
+        uploadedFilesResults.push(uploadResult);
+      }
+
+      // 4. Construct the Final Shareable Link
+      // If single file: use file permalink; if multiple files: link to the WorkDrive "Package" subfolder
+      let finalPhotosUrl = "";
+      if (uploadedFilesResults.length === 1) {
+        finalPhotosUrl = uploadedFilesResults[0].url;
+      } else {
+        // If multiple photos, provide the first file link or the folder URL
+        finalPhotosUrl = uploadedFilesResults[0].url; 
+      }
+
+      // 5. Update Zoho Creator Package Record
+      console.log(`📡 Updating Zoho Creator Package [${package_number}] with delivery photo link...`);
+      let creatorUpdated = false;
+      let creatorError = null;
+
+      try {
+        await updateCreatorRecord(
+          PACKAGES_REPORT_NAME,
+          "Package_Number",
+          package_number,
+          {
+            Package_Delivery_Photos: finalPhotosUrl
+          },
+          zohoToken
+        );
+        creatorUpdated = true;
+        console.log(`✅ Zoho Creator Package [${package_number}] updated successfully.`);
+      } catch (err) {
+        console.error(`❌ Creator Package Delivery Photos Update Failed:`, err.message);
+        creatorError = err.message;
+      }
+
+      // 6. Update MongoDB dispatches collection
+      const dispatchesColl = db.collection("dispatches");
+      const mongoFilter = dispatch_number 
+        ? { dispatch_number, "packages.package_number": package_number }
+        : { "packages.package_number": package_number };
+
+      await dispatchesColl.updateOne(
+        mongoFilter,
+        {
+          $set: {
+            "packages.$.delivery_photos_url": finalPhotosUrl,
+            "packages.$.delivery_photos_count": uploadedFilesResults.length,
+            "packages.$.photos_uploaded_at": new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          }
+        }
+      );
+
+      return c.json({
+        success: true,
+        message: `Delivery photos successfully uploaded and attached to Package [${package_number}].`,
+        deal_id,
+        package_number,
+        package_delivery_photos: finalPhotosUrl,
+        uploaded_count: uploadedFilesResults.length,
+        creator_synced: creatorUpdated,
+        creator_error: creatorError
+      });
+    });
+
+  } catch (err) {
+    console.error("❌ Upload Package Delivery Photos Failed:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
+  } finally {
+    // Local temp file cleanup
+    for (const tempPath of tempFilePaths) {
+      if (fs.existsSync(tempPath)) {
+        fs.unlink(tempPath, (err) => {
+          if (err) console.error("⚠️ Cleanup error for file:", tempPath, err.message);
+        });
+      }
+    }
   }
 };
