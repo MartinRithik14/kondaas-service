@@ -495,507 +495,120 @@ export const deleteOrder = async (c) => {
 };
 
 export const handleZohoDealWebhook = async (c) => {
-  try {
-    let payload = {};
+ try {
+    // 1. Extract query params string (e.g. ?deal_id=123&state=TamilNadu)
+    const url = new URL(c.req.url);
+    const queryString = url.search; // includes the leading '?' if present
 
-    // 1. Grab any URL query string parameters (e.g., ?deal_id=123)
-    const queryParams = c.req.query();
-    if (Object.keys(queryParams).length > 0) {
-      payload = { ...payload, ...queryParams };
+    // 2. Extract raw body text and headers
+    const rawBody = await c.req.text().catch(() => "");
+    const contentType = c.req.header("content-type") || "application/x-www-form-urlencoded";
+
+    // 3. Target AWS machine endpoint with query string attached
+    const targetUrl = `https://board.trisentrix.com/order/webhook${queryString}`;
+
+    const options = {
+      method: c.req.method,
+      headers: {
+        "Content-Type": contentType,
+      },
+    };
+
+    if (rawBody && ["POST", "PUT", "PATCH"].includes(c.req.method.toUpperCase())) {
+      options.body = rawBody;
     }
 
-    // 2. Read the raw text body to handle direct streams safely
-    const rawText = await c.req.text();
+    // 4. Forward to AWS instance
+    const awsResponse = await fetch(targetUrl, options);
 
-    if (rawText && rawText.trim().length > 0) {
-      try {
-        // Check if it's a pure JSON string
-        const parsedJson = JSON.parse(rawText);
-        payload = { ...payload, ...parsedJson };
-      } catch {
-        // If it's a form-encoded string (key1=val1&key2=val2)
-        const searchParams = new URLSearchParams(rawText);
-        const formObj = Object.fromEntries(searchParams.entries());
-        payload = { ...payload, ...formObj };
-      }
+    // 5. Safely parse response back to caller
+    const responseText = await awsResponse.text();
+    try {
+      const responseData = JSON.parse(responseText);
+      return c.json(responseData, awsResponse.status);
+    } catch {
+      return c.text(responseText, awsResponse.status);
     }
-
-    // Execute database operations safely using your wrapper
-    return await withDatabase(MONGODB_URI, async (db) => {
-
-      // 1. Query for all users whose role is admin
-      const admins = await db.collection("userDetails")
-        .find({ "UserInfo.role": "admin" })
-        .toArray();
-
-      console.log(`🔍 DB Check: Found ${admins.length} matching admin documents.`);
-
-      // 2. Safely collect all active fcmTokens into a clean array
-      let fcmTokens = [];
-      admins.forEach((adminUser, idx) => {
-        console.log(`👤 Processing Admin [${idx}]: Phone: ${adminUser.UserInfo?.phoneNo || "N/A"}`);
-
-        const devices = adminUser.PlatformInfo?.devices;
-        if (devices && Array.isArray(devices)) {
-          console.log(`📱 Found ${devices.length} devices mapped for this admin.`);
-          devices.forEach((device, dIdx) => {
-            console.log(`   👉 Device [${dIdx}] Token State:`, device.fcmToken ? "Token Available" : "Token is EMPTY/MISSING");
-            if (device.fcmToken) {
-              fcmTokens.push(device.fcmToken);
-            }
-          });
-        } else {
-          console.log(`⚠️ Admin [${idx}] has no active 'PlatformInfo.devices' array structure.`);
-        }
-      });
-
-      console.log("📊 Total Collected Admin Tokens Array Count:", fcmTokens.length);
-
-      // 3. Fire notifications if any admin devices were tracked down
-      if (fcmTokens.length > 0) {
-        const message = {
-          notification: {
-            title: "New Deal Created! 🚀",
-            body: `Deal: ${payload.deal_name || "New Opportunity"} is now in ${payload.stage || "Qualification"}.`,
-          },
-          // 🤖 Force High Priority and Channel Mapping for Android Default Sound
-          android: {
-            priority: "high",
-            notification: {
-              channelId: "weekly_summary_channel_v1", // 👈 Tells Android to use your high-importance channel rules
-              sound: "default",
-            }
-          },
-          // 🍏 Standard iOS Default Sound Setup
-          apns: {
-            payload: {
-              aps: {
-                sound: "default"
-              }
-            }
-          },
-          data: {
-            deal_id: payload.deal_id || "",
-          },
-          tokens: fcmTokens,
-        };
-
-        const response = await admin.messaging().sendEachForMulticast(message);
-        console.log(`✅ Push notifications dispatched successfully to ${response.successCount} admin devices.`);
-      } else {
-        console.log("⚠️ No active admin FCM tokens found in the database.");
-      }
-
-      return c.json({ success: true, message: "Captured and notifications processed" }, 200);
-    });
-
   } catch (err) {
-    console.error("❌ Webhook Processing Error Exception:", err.message);
-    return c.json({ error: "Failed to process deal webhook pipeline" }, 500);
+    console.error("❌ Zoho Assignment Proxy Error:", err.message);
+    return c.json({ error: `Proxy failure: ${err.message}` }, 500);
   }
 };
 
 
 export const assignDealToSurveyor = async (c) => {
-  try {
-    const body = await c.req.json();
+ try {
+    // 1. Extract query params string (e.g. ?deal_id=123&state=TamilNadu)
+    const url = new URL(c.req.url);
+    const queryString = url.search; // includes the leading '?' if present
 
-    const {
-      id,
-      name,
-      mobile,
-      whatsappNo,
-      email,
-      city,
-      address,
-      latitude,
-      longitude,
-      comment,
-      date,
-      surveyorNumber: rawSurveyorNumber
-    } = body;
+    // 2. Extract raw body text and headers
+    const rawBody = await c.req.text().catch(() => "");
+    const contentType = c.req.header("content-type") || "application/x-www-form-urlencoded";
 
-    if (!id || !rawSurveyorNumber || !mobile) {
-      return c.json({ error: "Missing required fields: id (deal_id), surveyorNumber, or mobile" }, 400);
+    // 3. Target AWS machine endpoint with query string attached
+    const targetUrl = `https://board.trisentrix.com/order/assign${queryString}`;
+
+    const options = {
+      method: c.req.method,
+      headers: {
+        "Content-Type": contentType,
+      },
+    };
+
+    if (rawBody && ["POST", "PUT", "PATCH"].includes(c.req.method.toUpperCase())) {
+      options.body = rawBody;
     }
 
-    // 🧼 CLEAN PHONE NUMBERS (Strips formatting symbols and drops leading country codes)
-    let surveyorNumber = String(rawSurveyorNumber).replace(/\D/g, '');
-    if (surveyorNumber.length === 12 && surveyorNumber.startsWith('91')) {
-      surveyorNumber = surveyorNumber.substring(2);
+    // 4. Forward to AWS instance
+    const awsResponse = await fetch(targetUrl, options);
+
+    // 5. Safely parse response back to caller
+    const responseText = await awsResponse.text();
+    try {
+      const responseData = JSON.parse(responseText);
+      return c.json(responseData, awsResponse.status);
+    } catch {
+      return c.text(responseText, awsResponse.status);
     }
-
-    let cleanMobile = mobile ? String(mobile).replace(/\D/g, '') : null;
-    if (cleanMobile && cleanMobile.length === 12 && cleanMobile.startsWith('91')) {
-      cleanMobile = cleanMobile.substring(2);
-    }
-
-    let cleanWhatsappNo = whatsappNo ? String(whatsappNo).replace(/\D/g, '') : null;
-    if (cleanWhatsappNo && cleanWhatsappNo.length === 12 && cleanWhatsappNo.startsWith('91')) {
-      cleanWhatsappNo = cleanWhatsappNo.substring(2);
-    }
-
-    return await withDatabase(MONGODB_URI, async (db) => {
-
-      const fullDealPayload = {
-        deal_id: id,
-        deal_name: name || "New Site Opportunity",
-        mobile: cleanMobile,
-        whatsappNo: cleanWhatsappNo,
-        email: email || null,
-        city: city || null,
-        address: address || null,
-        latitude: latitude || null,
-        longitude: longitude || null,
-        comment: comment || "",
-        siteSurveyStatus: "notassigned",
-        date: date || null,
-        assignedTo: surveyorNumber,
-        assignedAt: new Date().toISOString(),
-      };
-
-      await db.collection("deals").updateOne(
-        { deal_id: id },
-        { $set: fullDealPayload },
-        { upsert: true }
-      );
-
-      console.log(`🎯 Complete Deal payload for [${id}] successfully mapped to surveyor: ${surveyorNumber}`);
-
-      const surveyorProfile = await db.collection("userDetails").findOne({
-        "UserInfo.phoneNo": surveyorNumber,
-        "UserInfo.role": "surveyor"
-      });
-
-      if (!surveyorProfile) {
-        console.log(`⚠️ Assignment saved, but surveyor profile not found for number: ${surveyorNumber}`);
-        return c.json({ success: true, message: "Deal assigned locally, but surveyor profile missing." }, 200);
-      }
-
-      let surveyorTokens = [];
-      const devices = surveyorProfile.PlatformInfo?.devices || [];
-
-      // ⚡ TOKEN OPTIMIZATION: Try to find the active logged-in device session first
-      const activeDevice = devices.find(d => d.isLastLoggedIn === true && d.fcmToken);
-
-      if (activeDevice) {
-        surveyorTokens.push(activeDevice.fcmToken);
-      } else {
-        // Fallback: Collect all available tokens as a backup safety net
-        devices.forEach((device) => {
-          if (device.fcmToken) surveyorTokens.push(device.fcmToken);
-        });
-      }
-
-      if (surveyorTokens.length > 0) {
-        // Fixed the trailing syntax brace typo here from your template layout context
-        const structuredBody = `👤 Name : ${name || 'N/A'}\n📍 Address : ${address || 'N/A'}`;
-
-        const message = {
-          notification: {
-            title: "🔔 New Lead Nearby!",
-            body: structuredBody,
-          },
-          android: {
-            priority: "high",
-            notification: {
-              channelId: "custom_sound_channel_v2",
-              sound: "kondaas",
-              clickAction: "FLUTTER_NOTIFICATION_CLICK",
-            },
-            fcmOptions: {
-              analyticsLabel: "lead_assignment"
-            }
-          },
-          apns: {
-            payload: {
-              aps: {
-                sound: "kondaas.caf",
-                contentAvailable: true,
-                alert: {
-                  title: "🔔 New Lead Nearby!",
-                  body: structuredBody,
-                  launchImage: ""
-                }
-              }
-            }
-          },
-          data: {
-            deal_id: String(id),
-            click_action: "FLUTTER_NOTIFICATION_CLICK",
-            type: "ASSIGNMENT",
-            customer_name: name || "",
-            customer_mobile: cleanMobile || "",      // Clean parameter mapped to data object
-            customer_address: address || "",
-            leadId: String(id),
-            customerMobile: cleanMobile || "",      // Clean parameter mapped to data object
-            customerName: name || "",
-            address: address || "",
-          },
-          tokens: surveyorTokens,
-        };
-
-        const response = await admin.messaging().sendEachForMulticast(message);
-        console.log(`🚀 Notification sent to surveyor (${surveyorNumber}). Success count: ${response.successCount}`);
-      } else {
-        console.log(`⚠️ Surveyor found, but no active FCM tokens registered for phone: ${surveyorNumber}`);
-      }
-
-      return c.json({ success: true, message: "Deal successfully assigned and surveyor notified with clean parameters." }, 200);
-    });
-
   } catch (err) {
-    console.error("❌ Assignment Endpoint Error:", err.message);
-    return c.json({ error: "Internal server error during assignment pipeline" }, 500);
+    console.error("❌ Zoho Assignment Proxy Error:", err.message);
+    return c.json({ error: `Proxy failure: ${err.message}` }, 500);
   }
 };
 
 export const zohoWorkflowAssignment = async (c) => {
   try {
-    const urlQueries = c.req.query() || {};
-    let rawText = "";
+    const url = new URL(c.req.url);
+    const queryString = url.search;
+    const rawBody = await c.req.text().catch(() => "");
+    const contentType = c.req.header("content-type") || "application/x-www-form-urlencoded";
+
+    const targetUrl = `https://board.trisentrix.com/order/zoho-assign${queryString}`;
+
+    const options = {
+      method: c.req.method,
+      headers: {
+        "Content-Type": contentType,
+      },
+    };
+
+    if (rawBody && ["POST", "PUT", "PATCH"].includes(c.req.method.toUpperCase())) {
+      options.body = rawBody;
+    }
+
+    const awsResponse = await fetch(targetUrl, options);
+    const responseText = await awsResponse.text();
 
     try {
-      rawText = await c.req.text();
-    } catch (e) { }
-
-    let bodyParams = {};
-    if (rawText && rawText.trim().length > 0) {
-      try {
-        bodyParams = Object.fromEntries(new URLSearchParams(rawText.trim()));
-      } catch (e) { }
+      const responseData = JSON.parse(responseText);
+      return c.json(responseData, awsResponse.status);
+    } catch {
+      return c.text(responseText || "OK", awsResponse.status);
     }
-
-    const payload = { ...bodyParams, ...urlQueries };
-
-    const id = payload.deal_id || payload.id;
-    const name = payload.deal_name || payload.name;
-    const email = payload.Email || payload.customer_email || null;
-    const city = payload.city || null;
-    const state = payload.state || null;
-    const street = payload.Street || null;
-    const latitude = payload.latitude || null;
-    const longitude = payload.longitude || null;
-    const referred_by = payload.referred_by || null;
-    const Site_Survey_Req_Date_Time = payload.Site_Survey_Req_Date_Time || null;
-    const comment = payload.comment || "Assigned via Zoho CRM Automated Field Update";
-    const Service_Agent_Name = payload.Service_Agent_Name || null;
-    const home_location = payload.home_location || null;
-    const office_location = payload.office_location || null;
-
-    // ⚡ SMART PARSING WORKAROUND FOR COMBINED ZOHO FIELD:
-    let CreatedBy = null;
-    let District = null;
-    let SubDistrict = null;
-    let GoogleLocation = null;
-    let leadSource = null;
-    let postalCode = null;
-    let country = null;
-    let No_of_Panels = null;
-    let roofType = null;
-
-
-    const rawCreatedBy = payload.Created_By || null;
-
-    if (rawCreatedBy) {
-      if (rawCreatedBy.includes('&')) {
-        // Prepend 'CreatedBy=' so standard URLSearchParams can parse all sub-parameters seamlessly
-        const parsedParams = new URLSearchParams(`CreatedBy=${rawCreatedBy.trim()}`);
-
-        CreatedBy = parsedParams.get('CreatedBy')?.trim() || null;
-        No_of_Panels = parsedParams.get('No_of_Panels')?.trim() || null;
-        roofType = parsedParams.get('Roof_Type')?.trim() || null;
-        District = parsedParams.get('District')?.trim() || null;
-        SubDistrict = parsedParams.get('Sub_District')?.trim() || null;
-        GoogleLocation = parsedParams.get('Google_Location')?.trim() || null;
-        postalCode = parsedParams.get('postal_code')?.trim() || null;
-        country = parsedParams.get('country')?.trim() || null;
-        leadSource = parsedParams.get('lead_Source')?.trim() || parsedParams.get('leadSource')?.trim() || null;
-      } else {
-        // Fallback case if Zoho sends un-bundled standard text
-        CreatedBy = rawCreatedBy.trim();
-        District = payload.District?.trim() || null; 
-        SubDistrict = payload.Sub_District?.trim() || null;
-        GoogleLocation = payload.Google_Location?.trim() || null;
-        postalCode = payload.postal_code?.trim() || null;
-        country = payload.country?.trim() || null;
-        leadSource = payload.lead_Source?.trim() || payload.leadSource?.trim() || null;
-      }
-    } else {
-      // Direct payload fallback if Created_By is missing entirely
-      leadSource = payload.lead_Source?.trim() || payload.leadSource?.trim() || null;
-    }
-
-    const productType = payload.Product_Type || null;
-    const orderType = payload.Order_Type || null;
-    const projectType = payload.Project_Type || null;
-    const projectModel = payload.Project_Model || null;
-    const inverterConnectionType = payload.Inverter_Connection_Type || null;
-    const inverterCapacity = payload.Inverter_Capacity || null;
-    const solarPanel_Model = payload.Solar_Panel_Model || null;
-    const solarPanelBrand = payload.Solar_Panel_Brand || null;
-   
-
-    const siteEngineerContact = payload.site_engineer_contact || payload.Site_Engineer_Contact;
-
-    if (!id || !siteEngineerContact) {
-      return c.json({ error: "Missing required fields: id or site_engineer_contact from Zoho payload" }, 400);
-    }
-
-    // 🧼 Clean and strip phone formatting symbols from surveyor/engineer contact
-    let surveyorNumber = String(siteEngineerContact).replace(/\D/g, '');
-    if (surveyorNumber.length === 12 && surveyorNumber.startsWith('91')) {
-      surveyorNumber = surveyorNumber.substring(2);
-    }
-
-    // 🧼 CLEAN CUSTOMER PHONE NUMBERS BEFORE DB STORAGE AND FCM DELIVERY
-    let cleanMobile = payload.mobile ? String(payload.mobile).replace(/\D/g, '') : null;
-    if (cleanMobile && cleanMobile.length === 12 && cleanMobile.startsWith('91')) {
-      cleanMobile = cleanMobile.substring(2);
-    }
-
-    let cleanWhatsappNo = payload.whatsappNo || payload.customer_whatsapp || null;
-    if (cleanWhatsappNo) {
-      cleanWhatsappNo = String(cleanWhatsappNo).replace(/\D/g, '');
-      if (cleanWhatsappNo.length === 12 && cleanWhatsappNo.startsWith('91')) {
-        cleanWhatsappNo = cleanWhatsappNo.substring(2);
-      }
-    }
-
-    return await withDatabase(MONGODB_URI, async (db) => {
-
-      const fullDealPayload = {
-        deal_id: id,
-        deal_name: name || "New Site Opportunity",
-        mobile: cleanMobile,
-        whatsappNo: cleanWhatsappNo,
-        email: email,
-        city: city,
-        street: street,
-        latitude: latitude,
-        longitude: longitude,
-        comment: comment,
-        referred_by: referred_by,
-        Site_Survey_Req_Date_Time: Site_Survey_Req_Date_Time,
-        siteSurveyStatus: "notassigned",
-        assignedTo: surveyorNumber,
-        assignedAt: new Date().toISOString(),
-        leadSource: leadSource,
-        state: state,
-        postalCode: postalCode,
-        country: country,
-        CreatedBy: CreatedBy,
-        District: District,
-        ServiceAgentName: Service_Agent_Name,
-        SubDistrict: SubDistrict,
-        GoogleLocation: GoogleLocation,
-        home_location: home_location,
-        office_location: office_location,
-
-        productType: productType,
-        orderType: orderType,
-        projectType: projectType,
-        projectModel: projectModel,
-        inverterConnectionType: inverterConnectionType,
-        inverterCapacity: inverterCapacity,
-        solarPanelModel: solarPanel_Model,
-        solarPanelBrand: solarPanelBrand,
-        noOfPanels: No_of_Panels,
-        roofType: roofType,
-      };
-
-      await db.collection("deals").updateOne(
-        { deal_id: id },
-        { $set: fullDealPayload },
-        { upsert: true }
-      );
-
-      console.log(`🎯 Zoho Assignment Sync -> Deal: ${id} mapped to Surveyor: ${surveyorNumber}`);
-
-      const surveyorProfile = await db.collection("userDetails").findOne({
-        "UserInfo.phoneNo": surveyorNumber,
-        "UserInfo.role": "surveyor"
-      });
-
-      if (!surveyorProfile) {
-        console.log(`⚠️ Surveyor profile missing from database for number: ${surveyorNumber}`);
-        return c.json({ success: true, message: "Deal assignment locally, but surveyor profile missing." }, 200);
-      }
-
-      let surveyorTokens = [];
-      const devices = surveyorProfile.PlatformInfo?.devices || [];
-
-      // ⚡ TOKEN OPTIMIZATION: Isolate the single active device layout session
-      const activeDevice = devices.find(d => d.isLastLoggedIn === true && d.fcmToken);
-
-      if (activeDevice) {
-        surveyorTokens.push(activeDevice.fcmToken);
-      } else {
-        // Fallback safety net
-        devices.forEach((device) => {
-          if (device.fcmToken) surveyorTokens.push(device.fcmToken);
-        });
-      }
-
-      if (surveyorTokens.length > 0) {
-        const structuredBody = `👤 Name : ${name || 'N/A'}\n📍 Address : ${street || 'N/A'}`;
-
-        const message = {
-          notification: {
-            title: "🔔 New Lead Nearby!",
-            body: structuredBody,
-          },
-          android: {
-            priority: "high",
-            notification: {
-              channelId: "custom_sound_channel_v2",
-              sound: "kondaas",
-              clickAction: "FLUTTER_NOTIFICATION_CLICK",
-            },
-            fcmOptions: {
-              analyticsLabel: "lead_assignment"
-            }
-          },
-          apns: {
-            payload: {
-              aps: {
-                sound: "kondaas.caf",
-                contentAvailable: true,
-                alert: {
-                  title: "🔔 New Lead Nearby!",
-                  body: structuredBody,
-                  launchImage: ""
-                }
-              }
-            }
-          },
-          data: {
-            deal_id: String(id),
-            click_action: "FLUTTER_NOTIFICATION_CLICK",
-            type: "ASSIGNMENT",
-            customer_name: name || "",
-            customer_mobile: cleanMobile || "",
-            customer_address: street || "",
-            leadId: String(id),
-            customerMobile: cleanMobile || "",
-            customerName: name || "",
-            address: street || "",
-          },
-          tokens: surveyorTokens,
-        };
-
-        const response = await admin.messaging().sendEachForMulticast(message);
-        console.log(`🚀 Dispatch Notification -> Sent to: ${surveyorNumber} (Success count: ${response.successCount})`);
-      } else {
-        console.log(`⚠️ No active FCM device tokens registered for surveyor: ${surveyorNumber}`);
-      }
-
-      return c.json({ success: true, message: "Deal assignment complete and surveyor notified smoothly." }, 200);
-    });
-
   } catch (err) {
-    console.error("❌ Zoho Assignment Webhook Error:", err.message);
-    return c.json({ error: "Internal server error during Zoho assignment pipeline" }, 500);
+    console.error("❌ Zoho Assignment Proxy Error:", err.message);
+    return c.json({ error: `Proxy failure: ${err.message}` }, 500);
   }
 };
 
