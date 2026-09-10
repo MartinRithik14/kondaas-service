@@ -734,7 +734,7 @@ export const updateDispatchOrPackageStatus = async (c) => {
 
 
 
-
+//waiting to be used - dependency on Kondaas team
 export const uploadPackageDeliveryPhotos = async (c) => {
   const tempFilePaths = [];
 

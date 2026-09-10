@@ -12,4 +12,6 @@ templateRoutes.put('/update', updateTemplate);
 
 templateRoutes.get('/get/:id', getTemplate);
 
+
+
 export default templateRoutes;

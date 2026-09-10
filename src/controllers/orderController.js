@@ -4,26 +4,9 @@ import admin from 'firebase-admin';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
-// 🧮 Geolocation mathematical routing formula
-function haversineDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Radius of the earth in km
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((lat1 * Math.PI) / 180) *
-    Math.cos((lat2 * Math.PI) / 180) *
-    Math.sin(dLon / 2) *
-    Math.sin(dLon / 2);
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
 
-const getISTDateStrings = () => {
-  const date = new Date();
-  const todayDateOnly = date.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
-  const todayKey = todayDateOnly.replace(/-/g, "");
-  return { todayDateOnly, todayKey };
-};
+
+
 
 export const addOrder = async (c) => {
   try {
@@ -98,27 +81,75 @@ export const addOrder = async (c) => {
 export const rejectOrder = async (c) => {
   try {
     const body = await c.req.json();
-    const { customerMobile, surveyorNumber, comment, receivedAt, name, address } = body;
+    const { 
+      deal_id, 
+      dealId,
+      customerMobile, 
+      surveyorNumber, 
+      comment, 
+      receivedAt, 
+      name, 
+      address 
+    } = body;
+
+    const targetDealId = deal_id || dealId;
 
     if (!comment) {
       return c.json({ error: "Rejection reason (comment) is required" }, 400);
     }
 
     return await withDatabase(MONGODB_URI, async (db) => {
-      // 1. Safe local insert maintaining standard auditing schemas exclusively
+      // 1. Fetch current deal record to capture assignedBy, assignedAt, and correct deal_id
+      const dealFilter = targetDealId 
+        ? { deal_id: String(targetDealId) } 
+        : { mobile: customerMobile };
+
+      const existingDeal = await db.collection("deals").findOne(dealFilter);
+
+      const resolvedDealId = existingDeal?.deal_id || (targetDealId ? String(targetDealId) : null);
+      const assignedBy = existingDeal?.assignedBy || null;
+      const assignedAt = existingDeal?.assignedAt || null;
+
+      // 2. Safe local insert in surveyor_reject with complete audit snapshot
+      const rejectedTimestamp = receivedAt ? new Date(Number(receivedAt)).toISOString() : new Date().toISOString();
+
       const adminRejectPayload = {
-        name: name,
-        address: address,
-        surveyorNumber: surveyorNumber || "N/A",
-        customerMobile: customerMobile,
+        deal_id: resolvedDealId,
+        name: name || existingDeal?.deal_name || null,
+        surveyorNumber: surveyorNumber || existingDeal?.assignedTo || "N/A",
+        customerMobile: customerMobile || existingDeal?.mobile || null,
         comment: comment,
-        time: receivedAt ? new Date(Number(receivedAt)).toISOString() : null
+        assignedBy: assignedBy,
+        assignedAt: assignedAt,
+        rejectedAt: rejectedTimestamp, // Explicit rejection timestamp
+        time: rejectedTimestamp,       // Kept for backward compatibility
+        createdAt: new Date()
       };
 
-      await db.collection("surveyor_reject").insertOne(adminRejectPayload);
-      console.log(`✅ Rejection tracked locally in surveyor_reject collection for surveyor: ${surveyorNumber}`);
+      const rejectResult = await db.collection("surveyor_reject").insertOne(adminRejectPayload);
+      const rejectionMongoId = rejectResult.insertedId;
+      console.log(`✅ Rejection tracked in surveyor_reject (ID: ${rejectionMongoId}) for deal: ${resolvedDealId}`);
 
-      // 2. Look up active Administrator accounts to fetch their FCM tokens
+      // 3. Update the deal record: push rejection ID, set status to rejected, and remove assignment fields
+      const dealUpdateResult = await db.collection("deals").updateOne(
+        dealFilter,
+        {
+          $push: { rejections: rejectionMongoId },
+          $set: {
+            siteSurveyStatus: "rejected",
+            updatedAt: new Date()
+          },
+          $unset: {
+            assignedTo: "",
+            assignedAt: "",
+            assignedBy: ""
+          }
+        }
+      );
+
+      console.log(`🔄 Deal updated to status: rejected, assignment cleared. Matched: ${dealUpdateResult.matchedCount}, Modified: ${dealUpdateResult.modifiedCount}`);
+
+      // 4. Look up active Administrator accounts to fetch their FCM tokens
       try {
         const admins = await db.collection("userDetails").find({
           "UserInfo.role": "admin"
@@ -137,22 +168,20 @@ export const rejectOrder = async (c) => {
           }
         });
 
-        // 3. Send standard push notification exactly like your assignment style
+        // 5. Send standard push notification
         if (adminTokens.length > 0) {
           const message = {
             notification: {
               title: "Job Rejected by Surveyor! ⚠️",
-              body: `Surveyor ${surveyorNumber} rejected ${name || 'Customer'}. Reason: ${comment}`,
+              body: `Surveyor ${surveyorNumber || 'N/A'} rejected ${name || existingDeal?.deal_name || 'Customer'}. Reason: ${comment}`,
             },
-            // 🤖 Force High Priority and Channel Mapping for Android Default Sound
             android: {
               priority: "high",
               notification: {
-                channelId: "weekly_summary_channel_v1", // Ties into your high-importance channel
+                channelId: "weekly_summary_channel_v1",
                 sound: "default",
               }
             },
-            // 🍏 Standard iOS Default Sound Setup
             apns: {
               payload: {
                 aps: {
@@ -162,7 +191,9 @@ export const rejectOrder = async (c) => {
             },
             data: {
               click_action: "FLUTTER_NOTIFICATION_CLICK",
-              type: "REJECTION"
+              type: "REJECTION",
+              deal_id: String(resolvedDealId || ""),
+              surveyorNumber: String(surveyorNumber || "")
             },
             tokens: adminTokens,
           };
@@ -176,7 +207,11 @@ export const rejectOrder = async (c) => {
         console.error("⚠️ Non-blocking warning: Failed to send Admin notification:", pushErr.message);
       }
 
-      return c.json({ success: true, message: "Order rejection cataloged and Admin notified." });
+      return c.json({ 
+        success: true, 
+        message: "Order rejection cataloged, deal reset, and Admin notified.",
+        rejectionId: rejectionMongoId
+      });
     });
   } catch (err) {
     console.error("❌ RejectOrder Exception Error:", err.message);
@@ -223,22 +258,74 @@ export const deleteDeal = async (c) => {
 export const completeOrder = async (c) => {
   try {
     const body = await c.req.json();
-    const { customerMobile, surveyorNumber, receivedAt, name, address } = body;
+    const { 
+      deal_id, 
+      dealId, 
+      customerMobile, 
+      surveyorNumber, 
+      receivedAt, 
+      name, 
+      address 
+    } = body;
+
+    const targetDealId = deal_id || dealId;
 
     return await withDatabase(MONGODB_URI, async (db) => {
-      // Safe local insert maintaining standard auditing schemas exclusively
+      // 1. Fetch current deal record to capture assignedBy, assignedAt, assignedTo, and correct deal_id
+      const dealFilter = targetDealId 
+        ? { deal_id: String(targetDealId) } 
+        : { mobile: customerMobile };
+
+      const existingDeal = await db.collection("deals").findOne(dealFilter);
+
+      const resolvedDealId = existingDeal?.deal_id || (targetDealId ? String(targetDealId) : null);
+      const assignedTo = surveyorNumber || existingDeal?.assignedTo || "N/A";
+      const assignedBy = existingDeal?.assignedBy || null;
+      const assignedAt = existingDeal?.assignedAt || null;
+
+      const completedTimestamp = receivedAt 
+        ? new Date(Number(receivedAt)).toISOString() 
+        : new Date().toISOString();
+
+      // 2. Insert audit snapshot into surveyor_complete collection
       const adminCompletePayload = {
-        surveyorNumber: surveyorNumber || "N/A",
-        customerMobile: customerMobile,
-        name: name,
-        address: address,
-        time: receivedAt ? new Date(Number(receivedAt)).toISOString() : null
+        deal_id: resolvedDealId,
+        surveyorNumber: assignedTo,
+        customerMobile: customerMobile || existingDeal?.mobile || null,
+        name: name || existingDeal?.deal_name || null,
+        address: address || existingDeal?.street || null,
+        assignedTo: assignedTo,
+        assignedBy: assignedBy,
+        assignedAt: assignedAt,
+        completedAt: completedTimestamp,
+        time: completedTimestamp, // Kept for backwards compatibility
+        createdAt: new Date()
       };
 
-      await db.collection("surveyor_complete").insertOne(adminCompletePayload);
-      console.log(`✅ Completion tracked locally in surveyor_complete collection for surveyor: ${surveyorNumber}`);
+      const completeResult = await db.collection("surveyor_complete").insertOne(adminCompletePayload);
+      const completionMongoId = completeResult.insertedId;
+      console.log(`✅ Completion tracked in surveyor_complete (ID: ${completionMongoId}) for deal: ${resolvedDealId}`);
 
-      return c.json({ success: true, message: "Order completion cataloged locally." });
+      // 3. Update the deal record to mark as completed
+      const dealUpdateResult = await db.collection("deals").updateOne(
+        dealFilter,
+        {
+          $set: {
+            siteSurveyStatus: "completed",
+            completedAt: completedTimestamp,
+            completedId: completionMongoId,
+            updatedAt: new Date()
+          }
+        }
+      );
+
+      console.log(`🎯 Deal updated to status: completed. Matched: ${dealUpdateResult.matchedCount}, Modified: ${dealUpdateResult.modifiedCount}`);
+
+      return c.json({ 
+        success: true, 
+        message: "Order completion cataloged locally and deal marked as completed.",
+        completedId: completionMongoId
+      });
     });
   } catch (err) {
     console.error("❌ Completion Exception Error:", err.message);
@@ -495,120 +582,512 @@ export const deleteOrder = async (c) => {
 };
 
 export const handleZohoDealWebhook = async (c) => {
- try {
-    // 1. Extract query params string (e.g. ?deal_id=123&state=TamilNadu)
-    const url = new URL(c.req.url);
-    const queryString = url.search; // includes the leading '?' if present
+  try {
+    let payload = {};
 
-    // 2. Extract raw body text and headers
-    const rawBody = await c.req.text().catch(() => "");
-    const contentType = c.req.header("content-type") || "application/x-www-form-urlencoded";
-
-    // 3. Target AWS machine endpoint with query string attached
-    const targetUrl = `https://board.trisentrix.com/order/webhook${queryString}`;
-
-    const options = {
-      method: c.req.method,
-      headers: {
-        "Content-Type": contentType,
-      },
-    };
-
-    if (rawBody && ["POST", "PUT", "PATCH"].includes(c.req.method.toUpperCase())) {
-      options.body = rawBody;
+    // 1. Grab any URL query string parameters (e.g., ?deal_id=123)
+    const queryParams = c.req.query();
+    if (Object.keys(queryParams).length > 0) {
+      payload = { ...payload, ...queryParams };
     }
 
-    // 4. Forward to AWS instance
-    const awsResponse = await fetch(targetUrl, options);
+    // 2. Read the raw text body to handle direct streams safely
+    const rawText = await c.req.text();
 
-    // 5. Safely parse response back to caller
-    const responseText = await awsResponse.text();
-    try {
-      const responseData = JSON.parse(responseText);
-      return c.json(responseData, awsResponse.status);
-    } catch {
-      return c.text(responseText, awsResponse.status);
+    if (rawText && rawText.trim().length > 0) {
+      try {
+        // Check if it's a pure JSON string
+        const parsedJson = JSON.parse(rawText);
+        payload = { ...payload, ...parsedJson };
+      } catch {
+        // If it's a form-encoded string (key1=val1&key2=val2)
+        const searchParams = new URLSearchParams(rawText);
+        const formObj = Object.fromEntries(searchParams.entries());
+        payload = { ...payload, ...formObj };
+      }
     }
+
+    // Execute database operations safely using your wrapper
+    return await withDatabase(MONGODB_URI, async (db) => {
+
+      // 1. Query for all users whose role is admin
+      const admins = await db.collection("userDetails")
+        .find({ "UserInfo.role": "admin" })
+        .toArray();
+
+      console.log(`🔍 DB Check: Found ${admins.length} matching admin documents.`);
+
+      // 2. Safely collect all active fcmTokens into a clean array
+      let fcmTokens = [];
+      admins.forEach((adminUser, idx) => {
+        console.log(`👤 Processing Admin [${idx}]: Phone: ${adminUser.UserInfo?.phoneNo || "N/A"}`);
+
+        const devices = adminUser.PlatformInfo?.devices;
+        if (devices && Array.isArray(devices)) {
+          console.log(`📱 Found ${devices.length} devices mapped for this admin.`);
+          devices.forEach((device, dIdx) => {
+            console.log(`   👉 Device [${dIdx}] Token State:`, device.fcmToken ? "Token Available" : "Token is EMPTY/MISSING");
+            if (device.fcmToken) {
+              fcmTokens.push(device.fcmToken);
+            }
+          });
+        } else {
+          console.log(`⚠️ Admin [${idx}] has no active 'PlatformInfo.devices' array structure.`);
+        }
+      });
+
+      console.log("📊 Total Collected Admin Tokens Array Count:", fcmTokens.length);
+
+      // 3. Fire notifications if any admin devices were tracked down
+      if (fcmTokens.length > 0) {
+        const message = {
+          notification: {
+            title: "New Deal Created! 🚀",
+            body: `Deal: ${payload.deal_name || "New Opportunity"} is now in ${payload.stage || "Qualification"}.`,
+          },
+          // 🤖 Force High Priority and Channel Mapping for Android Default Sound
+          android: {
+            priority: "high",
+            notification: {
+              channelId: "weekly_summary_channel_v1", // 👈 Tells Android to use your high-importance channel rules
+              sound: "default",
+            }
+          },
+          // 🍏 Standard iOS Default Sound Setup
+          apns: {
+            payload: {
+              aps: {
+                sound: "default"
+              }
+            }
+          },
+          data: {
+            deal_id: payload.deal_id || "",
+          },
+          tokens: fcmTokens,
+        };
+
+        const response = await admin.messaging().sendEachForMulticast(message);
+        console.log(`✅ Push notifications dispatched successfully to ${response.successCount} admin devices.`);
+      } else {
+        console.log("⚠️ No active admin FCM tokens found in the database.");
+      }
+
+      return c.json({ success: true, message: "Captured and notifications processed" }, 200);
+    });
+
   } catch (err) {
-    console.error("❌ Zoho Assignment Proxy Error:", err.message);
-    return c.json({ error: `Proxy failure: ${err.message}` }, 500);
+    console.error("❌ Webhook Processing Error Exception:", err.message);
+    return c.json({ error: "Failed to process deal webhook pipeline" }, 500);
   }
 };
 
 
 export const assignDealToSurveyor = async (c) => {
- try {
-    // 1. Extract query params string (e.g. ?deal_id=123&state=TamilNadu)
-    const url = new URL(c.req.url);
-    const queryString = url.search; // includes the leading '?' if present
+  try {
+    const body = await c.req.json();
 
-    // 2. Extract raw body text and headers
-    const rawBody = await c.req.text().catch(() => "");
-    const contentType = c.req.header("content-type") || "application/x-www-form-urlencoded";
+    const {
+      id,
+      name,
+      mobile,
+      whatsappNo,
+      email,
+      city,
+      address,
+      latitude,
+      longitude,
+      comment,
+      date,
+      surveyorNumber: rawSurveyorNumber
+    } = body;
 
-    // 3. Target AWS machine endpoint with query string attached
-    const targetUrl = `https://board.trisentrix.com/order/assign${queryString}`;
-
-    const options = {
-      method: c.req.method,
-      headers: {
-        "Content-Type": contentType,
-      },
-    };
-
-    if (rawBody && ["POST", "PUT", "PATCH"].includes(c.req.method.toUpperCase())) {
-      options.body = rawBody;
+    if (!id || !rawSurveyorNumber || !mobile) {
+      return c.json({ error: "Missing required fields: id (deal_id), surveyorNumber, or mobile" }, 400);
     }
 
-    // 4. Forward to AWS instance
-    const awsResponse = await fetch(targetUrl, options);
-
-    // 5. Safely parse response back to caller
-    const responseText = await awsResponse.text();
-    try {
-      const responseData = JSON.parse(responseText);
-      return c.json(responseData, awsResponse.status);
-    } catch {
-      return c.text(responseText, awsResponse.status);
+    // 🧼 CLEAN PHONE NUMBERS (Strips formatting symbols and drops leading country codes)
+    let surveyorNumber = String(rawSurveyorNumber).replace(/\D/g, '');
+    if (surveyorNumber.length === 12 && surveyorNumber.startsWith('91')) {
+      surveyorNumber = surveyorNumber.substring(2);
     }
+
+    let cleanMobile = mobile ? String(mobile).replace(/\D/g, '') : null;
+    if (cleanMobile && cleanMobile.length === 12 && cleanMobile.startsWith('91')) {
+      cleanMobile = cleanMobile.substring(2);
+    }
+
+    let cleanWhatsappNo = whatsappNo ? String(whatsappNo).replace(/\D/g, '') : null;
+    if (cleanWhatsappNo && cleanWhatsappNo.length === 12 && cleanWhatsappNo.startsWith('91')) {
+      cleanWhatsappNo = cleanWhatsappNo.substring(2);
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+
+      const fullDealPayload = {
+        deal_id: id,
+        deal_name: name || "New Site Opportunity",
+        mobile: cleanMobile,
+        whatsappNo: cleanWhatsappNo,
+        email: email || null,
+        city: city || null,
+        address: address || null,
+        latitude: latitude || null,
+        longitude: longitude || null,
+        comment: comment || "",
+        siteSurveyStatus: "notassigned",
+        date: date || null,
+        assignedTo: surveyorNumber,
+        assignedAt: new Date().toISOString(),
+      };
+
+      await db.collection("deals").updateOne(
+        { deal_id: id },
+        { $set: fullDealPayload },
+        { upsert: true }
+      );
+
+      console.log(`🎯 Complete Deal payload for [${id}] successfully mapped to surveyor: ${surveyorNumber}`);
+
+      const surveyorProfile = await db.collection("userDetails").findOne({
+        "UserInfo.phoneNo": surveyorNumber,
+        "UserInfo.role": "surveyor"
+      });
+
+      if (!surveyorProfile) {
+        console.log(`⚠️ Assignment saved, but surveyor profile not found for number: ${surveyorNumber}`);
+        return c.json({ success: true, message: "Deal assigned locally, but surveyor profile missing." }, 200);
+      }
+
+      let surveyorTokens = [];
+      const devices = surveyorProfile.PlatformInfo?.devices || [];
+
+      // ⚡ TOKEN OPTIMIZATION: Try to find the active logged-in device session first
+      const activeDevice = devices.find(d => d.isLastLoggedIn === true && d.fcmToken);
+
+      if (activeDevice) {
+        surveyorTokens.push(activeDevice.fcmToken);
+      } else {
+        // Fallback: Collect all available tokens as a backup safety net
+        devices.forEach((device) => {
+          if (device.fcmToken) surveyorTokens.push(device.fcmToken);
+        });
+      }
+
+      if (surveyorTokens.length > 0) {
+        // Fixed the trailing syntax brace typo here from your template layout context
+        const structuredBody = `👤 Name : ${name || 'N/A'}\n📍 Address : ${address || 'N/A'}`;
+
+        const message = {
+          notification: {
+            title: "🔔 New Lead Nearby!",
+            body: structuredBody,
+          },
+          android: {
+            priority: "high",
+            notification: {
+              channelId: "custom_sound_channel_v2",
+              sound: "kondaas",
+              clickAction: "FLUTTER_NOTIFICATION_CLICK",
+            },
+            fcmOptions: {
+              analyticsLabel: "lead_assignment"
+            }
+          },
+          apns: {
+            payload: {
+              aps: {
+                sound: "kondaas.caf",
+                contentAvailable: true,
+                alert: {
+                  title: "🔔 New Lead Nearby!",
+                  body: structuredBody,
+                  launchImage: ""
+                }
+              }
+            }
+          },
+          data: {
+            deal_id: String(id),
+            click_action: "FLUTTER_NOTIFICATION_CLICK",
+            type: "ASSIGNMENT",
+            customer_name: name || "",
+            customer_mobile: cleanMobile || "",      // Clean parameter mapped to data object
+            customer_address: address || "",
+            leadId: String(id),
+            customerMobile: cleanMobile || "",      // Clean parameter mapped to data object
+            customerName: name || "",
+            address: address || "",
+          },
+          tokens: surveyorTokens,
+        };
+
+        const response = await admin.messaging().sendEachForMulticast(message);
+        console.log(`🚀 Notification sent to surveyor (${surveyorNumber}). Success count: ${response.successCount}`);
+      } else {
+        console.log(`⚠️ Surveyor found, but no active FCM tokens registered for phone: ${surveyorNumber}`);
+      }
+
+      return c.json({ success: true, message: "Deal successfully assigned and surveyor notified with clean parameters." }, 200);
+    });
+
   } catch (err) {
-    console.error("❌ Zoho Assignment Proxy Error:", err.message);
-    return c.json({ error: `Proxy failure: ${err.message}` }, 500);
+    console.error("❌ Assignment Endpoint Error:", err.message);
+    return c.json({ error: "Internal server error during assignment pipeline" }, 500);
   }
 };
 
 export const zohoWorkflowAssignment = async (c) => {
   try {
-    const url = new URL(c.req.url);
-    const queryString = url.search;
-    const rawBody = await c.req.text().catch(() => "");
-    const contentType = c.req.header("content-type") || "application/x-www-form-urlencoded";
-
-    const targetUrl = `https://board.trisentrix.com/order/zoho-assign${queryString}`;
-
-    const options = {
-      method: c.req.method,
-      headers: {
-        "Content-Type": contentType,
-      },
-    };
-
-    if (rawBody && ["POST", "PUT", "PATCH"].includes(c.req.method.toUpperCase())) {
-      options.body = rawBody;
-    }
-
-    const awsResponse = await fetch(targetUrl, options);
-    const responseText = await awsResponse.text();
+    const urlQueries = c.req.query() || {};
+    let rawText = "";
 
     try {
-      const responseData = JSON.parse(responseText);
-      return c.json(responseData, awsResponse.status);
-    } catch {
-      return c.text(responseText || "OK", awsResponse.status);
+      rawText = await c.req.text();
+    } catch (e) { }
+
+    let bodyParams = {};
+    if (rawText && rawText.trim().length > 0) {
+      try {
+        bodyParams = Object.fromEntries(new URLSearchParams(rawText.trim()));
+      } catch (e) { }
     }
+
+    const payload = { ...bodyParams, ...urlQueries };
+
+    const id = payload.deal_id || payload.id;
+    const name = payload.deal_name || payload.name;
+    const email = payload.Email || payload.customer_email || null;
+    const city = payload.city || null;
+    const state = payload.state || null;
+    const street = payload.Street || null;
+    const latitude = payload.latitude || null;
+    const longitude = payload.longitude || null;
+    const referred_by = payload.referred_by || null;
+    const Site_Survey_Req_Date_Time = payload.Site_Survey_Req_Date_Time || null;
+    const comment = payload.comment || "Assigned via Zoho CRM Automated Field Update";
+    const Service_Agent_Name = payload.Service_Agent_Name || null;
+    const home_location = payload.home_location || null;
+    const office_location = payload.office_location || null;
+
+    // ⚡ SMART PARSING WORKAROUND FOR COMBINED ZOHO FIELD:
+    let CreatedBy = null;
+    let District = null;
+    let SubDistrict = null;
+    let GoogleLocation = null;
+    let leadSource = null;
+    let postalCode = null;
+    let country = null;
+    let No_of_Panels = null;
+    let roofType = null;
+
+    const rawCreatedBy = payload.Created_By || null;
+
+    if (rawCreatedBy) {
+      if (rawCreatedBy.includes('&')) {
+        // Prepend 'CreatedBy=' so standard URLSearchParams can parse all sub-parameters seamlessly
+        const parsedParams = new URLSearchParams(`CreatedBy=${rawCreatedBy.trim()}`);
+
+        CreatedBy = parsedParams.get('CreatedBy')?.trim() || null;
+        No_of_Panels = parsedParams.get('No_of_Panels')?.trim() || null;
+        roofType = parsedParams.get('Roof_Type')?.trim() || null;
+        District = parsedParams.get('District')?.trim() || null;
+        SubDistrict = parsedParams.get('Sub_District')?.trim() || null;
+        GoogleLocation = parsedParams.get('Google_Location')?.trim() || null;
+        postalCode = parsedParams.get('postal_code')?.trim() || null;
+        country = parsedParams.get('country')?.trim() || null;
+        leadSource = parsedParams.get('lead_Source')?.trim() || parsedParams.get('leadSource')?.trim() || null;
+      } else {
+        // Fallback case if Zoho sends un-bundled standard text
+        CreatedBy = rawCreatedBy.trim();
+        District = payload.District?.trim() || null; 
+        SubDistrict = payload.Sub_District?.trim() || null;
+        GoogleLocation = payload.Google_Location?.trim() || null;
+        postalCode = payload.postal_code?.trim() || null;
+        country = payload.country?.trim() || null;
+        leadSource = payload.lead_Source?.trim() || payload.leadSource?.trim() || null;
+      }
+    } else {
+      // Direct payload fallback if Created_By is missing entirely
+      leadSource = payload.lead_Source?.trim() || payload.leadSource?.trim() || null;
+    }
+
+    const productType = payload.Product_Type || null;
+    const orderType = payload.Order_Type || null;
+    const projectType = payload.Project_Type || null;
+    const projectModel = payload.Project_Model || null;
+    const inverterConnectionType = payload.Inverter_Connection_Type || null;
+    const inverterCapacity = payload.Inverter_Capacity || null;
+    const solarPanel_Model = payload.Solar_Panel_Model || null;
+    const solarPanelBrand = payload.Solar_Panel_Brand || null;
+
+    const siteEngineerContact = payload.site_engineer_contact || payload.Site_Engineer_Contact;
+
+    if (!id || !siteEngineerContact) {
+      return c.json({ error: "Missing required fields: id or site_engineer_contact from Zoho payload" }, 400);
+    }
+
+    // 🧼 Clean and strip phone formatting symbols from surveyor/engineer contact
+    let surveyorNumber = String(siteEngineerContact).replace(/\D/g, '');
+    if (surveyorNumber.length === 12 && surveyorNumber.startsWith('91')) {
+      surveyorNumber = surveyorNumber.substring(2);
+    }
+
+    // 🧼 CLEAN CUSTOMER PHONE NUMBERS BEFORE DB STORAGE AND FCM DELIVERY
+    let cleanMobile = payload.mobile ? String(payload.mobile).replace(/\D/g, '') : null;
+    if (cleanMobile && cleanMobile.length === 12 && cleanMobile.startsWith('91')) {
+      cleanMobile = cleanMobile.substring(2);
+    }
+
+    let cleanWhatsappNo = payload.whatsappNo || payload.customer_whatsapp || null;
+    if (cleanWhatsappNo) {
+      cleanWhatsappNo = String(cleanWhatsappNo).replace(/\D/g, '');
+      if (cleanWhatsappNo.length === 12 && cleanWhatsappNo.startsWith('91')) {
+        cleanWhatsappNo = cleanWhatsappNo.substring(2);
+      }
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+
+      const fullDealPayload = {
+        deal_id: id,
+        deal_name: name || "New Site Opportunity",
+        mobile: cleanMobile,
+        whatsappNo: cleanWhatsappNo,
+        email: email,
+        city: city,
+        street: street,
+        latitude: latitude,
+        longitude: longitude,
+        comment: comment,
+        referred_by: referred_by,
+        Site_Survey_Req_Date_Time: Site_Survey_Req_Date_Time,
+        siteSurveyStatus: "assigned", // ⚡ Updated from "notassigned" to "assigned"
+        assignedTo: surveyorNumber,
+        assignedAt: new Date().toISOString(),
+        updatedAt: new Date(),
+        leadSource: leadSource,
+        state: state,
+        postalCode: postalCode,
+        country: country,
+        CreatedBy: CreatedBy,
+        District: District,
+        ServiceAgentName: Service_Agent_Name,
+        SubDistrict: SubDistrict,
+        GoogleLocation: GoogleLocation,
+        home_location: home_location,
+        office_location: office_location,
+
+        productType: productType,
+        orderType: orderType,
+        projectType: projectType,
+        projectModel: projectModel,
+        inverterConnectionType: inverterConnectionType,
+        inverterCapacity: inverterCapacity,
+        solarPanelModel: solarPanel_Model,
+        solarPanelBrand: solarPanelBrand,
+        noOfPanels: No_of_Panels,
+        roofType: roofType,
+      };
+
+      await db.collection("deals").updateOne(
+        { deal_id: id },
+        { 
+          $set: fullDealPayload,
+          $setOnInsert: {
+            createdAt: new Date(),
+            rejections: []
+          }
+        },
+        { upsert: true }
+      );
+
+      console.log(`🎯 Zoho Assignment Sync -> Deal: ${id} mapped to Surveyor: ${surveyorNumber}`);
+
+      const surveyorProfile = await db.collection("userDetails").findOne({
+        "UserInfo.phoneNo": surveyorNumber,
+        "UserInfo.role": "surveyor"
+      });
+
+      if (!surveyorProfile) {
+        console.log(`⚠️ Surveyor profile missing from database for number: ${surveyorNumber}`);
+        return c.json({ success: true, message: "Deal assignment locally, but surveyor profile missing." }, 200);
+      }
+
+      let surveyorTokens = [];
+      const devices = surveyorProfile.PlatformInfo?.devices || [];
+
+      // ⚡ TOKEN OPTIMIZATION: Isolate the single active device layout session
+      const activeDevice = devices.find(d => d.isLastLoggedIn === true && d.fcmToken);
+
+      if (activeDevice) {
+        surveyorTokens.push(activeDevice.fcmToken);
+      } else {
+        // Fallback safety net
+        devices.forEach((device) => {
+          if (device.fcmToken) surveyorTokens.push(device.fcmToken);
+        });
+      }
+
+      if (surveyorTokens.length > 0) {
+        const structuredBody = `👤 Name : ${name || 'N/A'}\n📍 Address : ${street || 'N/A'}`;
+
+        const message = {
+          notification: {
+            title: "🔔 New Lead Nearby!",
+            body: structuredBody,
+          },
+          android: {
+            priority: "high",
+            notification: {
+              channelId: "custom_sound_channel_v2",
+              sound: "kondaas",
+              clickAction: "FLUTTER_NOTIFICATION_CLICK",
+            },
+            fcmOptions: {
+              analyticsLabel: "lead_assignment"
+            }
+          },
+          apns: {
+            payload: {
+              aps: {
+                sound: "kondaas.caf",
+                contentAvailable: true,
+                alert: {
+                  title: "🔔 New Lead Nearby!",
+                  body: structuredBody,
+                  launchImage: ""
+                }
+              }
+            }
+          },
+          data: {
+            deal_id: String(id),
+            click_action: "FLUTTER_NOTIFICATION_CLICK",
+            type: "ASSIGNMENT",
+            customer_name: name || "",
+            customer_mobile: cleanMobile || "",
+            customer_address: street || "",
+            leadId: String(id),
+            customerMobile: cleanMobile || "",
+            customerName: name || "",
+            address: street || "",
+          },
+          tokens: surveyorTokens,
+        };
+
+        const response = await admin.messaging().sendEachForMulticast(message);
+        console.log(`🚀 Dispatch Notification -> Sent to: ${surveyorNumber} (Success count: ${response.successCount})`);
+      } else {
+        console.log(`⚠️ No active FCM device tokens registered for surveyor: ${surveyorNumber}`);
+      }
+
+      return c.json({ success: true, message: "Deal assignment complete and surveyor notified smoothly." }, 200);
+    });
+
   } catch (err) {
-    console.error("❌ Zoho Assignment Proxy Error:", err.message);
-    return c.json({ error: `Proxy failure: ${err.message}` }, 500);
+    console.error("❌ Zoho Assignment Webhook Error:", err.message);
+    return c.json({ error: "Internal server error during Zoho assignment pipeline" }, 500);
   }
 };
 
@@ -641,3 +1120,142 @@ export const getSurveyorDeals = async (c) => {
     return c.json({ error: "Failed to pull surveyor task workspace" }, 500);
   }
 };
+
+
+export const zohoDealCreatedWebhook = async (c) => {
+  try {
+    let payload;
+    const contentType = c.req.header("content-type") || "";
+    if (contentType.includes("application/json")) {
+      payload = await c.req.json();
+    } else {
+      payload = await c.req.parseBody();
+    }
+
+    console.log("📥 Incoming Zoho Deal Created Webhook:", payload);
+
+    const dealId = payload.deal_id || payload.id || payload.Deal_Id;
+    const dealName = payload.deal_name || payload.Deal_Name;
+    const mobile = payload.mobile || payload.Mobile || payload.phone;
+    const district = payload.district || payload.District;
+    const state = payload.state || payload.State;
+    const createdBy = payload.created_by || payload.Created_By;
+    const emp_mail = payload.emp_mail;
+    const emp_mobile = payload.emp_mobile;
+
+    if (!dealId) {
+      return c.json({ error: "Missing deal_id in payload" }, 400);
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      // 1. Log or update the creator in emp_info
+      await trackEmployeeDealCreation(db, { createdBy, emp_mail, emp_mobile });
+
+      // 2. Safe upsert of the new deal skeleton
+      const result = await db.collection("deals").updateOne(
+        { deal_id: String(dealId) },
+        {
+          $setOnInsert: {
+            deal_id: String(dealId),
+            deal_name: dealName || null,
+            mobile: mobile || null,
+            District: district || null,
+            state: state || null,
+            CreatedBy: createdBy || null,
+            emp_mail: emp_mail || null,
+            emp_mobile: emp_mobile || null,
+            siteSurveyStatus: "unassigned",
+            assignedTo: null,
+            assignedBy: null,
+            assignedAt: null,
+            rejections: [],
+            createdAt: new Date()
+          },
+          $set: {
+            updatedAt: new Date()
+          }
+        },
+        { upsert: true }
+      );
+
+      console.log(`✅ [Zoho Webhook] Deal created/synced as unassigned: ${dealId}`);
+      return c.json({ success: true, message: "Deal synced as unassigned", result });
+    });
+
+  } catch (err) {
+    console.error("❌ Zoho Deal Created Webhook Exception:", err.message);
+    return c.json({ error: err.message }, 500);
+  }
+};
+
+
+async function getNextEmpSequence(db, sequenceName = "emp_dummy_mobile") {
+  const result = await db.collection("counters").findOneAndUpdate(
+    { _id: sequenceName },
+    { $inc: { seq: 1 } },
+    { upsert: true, returnDocument: "after" }
+  );
+
+  // If newly created or counter has not reached 1000 yet, initialize at 1000
+  if (!result || result.seq <= 1000) {
+    await db.collection("counters").updateOne(
+      { _id: sequenceName },
+      { $set: { seq: 1000 } }
+    );
+    return "1000";
+  }
+
+  return String(result.seq);
+}
+
+
+export async function trackEmployeeDealCreation(db, { createdBy, emp_mail, emp_mobile }) {
+  const cleanName = createdBy ? String(createdBy).trim() : null;
+  const cleanEmail = emp_mail ? String(emp_mail).trim().toLowerCase() : null;
+  let cleanMobile = emp_mobile ? String(emp_mobile).replace(/\D/g, '').replace(/^91/, '') : null;
+
+  // Ignore if no identifiable creator info exists
+  if (!cleanName && !cleanEmail) {
+    return null;
+  }
+
+  // Find existing employee record by email (preferred) or name
+  const empFilter = cleanEmail ? { email: cleanEmail } : { name: cleanName };
+  const existingEmp = await db.collection("emp_info").findOne(empFilter);
+
+  if (existingEmp) {
+    const updates = {
+      $inc: { dealsCreatedCount: 1 },
+      $set: { updatedAt: new Date() }
+    };
+
+    // If existing record was missing mobile or name and we have it now, patch it
+    if (!existingEmp.mobile && cleanMobile) {
+      updates.$set.mobile = cleanMobile;
+    }
+    if (!existingEmp.name && cleanName) {
+      updates.$set.name = cleanName;
+    }
+
+    await db.collection("emp_info").updateOne({ _id: existingEmp._id }, updates);
+    return existingEmp._id;
+  }
+
+  // If new employee has no mobile provided, generate dummy mobile (1000, 1001, etc.)
+  if (!cleanMobile) {
+    cleanMobile = await getNextEmpSequence(db);
+  }
+
+  const newEmpDoc = {
+    name: cleanName || "Unknown Employee",
+    email: cleanEmail,
+    mobile: cleanMobile,
+    dealsCreatedCount: 1,
+    createdAt: new Date(),
+    updatedAt: new Date()
+  };
+
+  const insertResult = await db.collection("emp_info").insertOne(newEmpDoc);
+  console.log(`👤 New employee logged in emp_info: ${newEmpDoc.name} (Mobile: ${cleanMobile})`);
+  return insertResult.insertedId;
+}
