@@ -440,6 +440,25 @@ const SERVICE_AGENT_PHONE_FIELD = "Phone";
 // Module API name confirmed via test endpoint: "Service_Agents"
 const SERVICE_AGENT_MODULE_API_NAME = "Service_Agents";
 
+// Converts an ISO datetime (as the live Deals API returns) into the same
+// 'MM-DD-YYYY HH:mm:ss' string format the webhook's merge field produces,
+// so both write paths store this field identically.
+function formatToWebhookDateString(isoString) {
+  if (!isoString) return null;
+  const d = new Date(isoString);
+  if (isNaN(d.getTime())) return null;
+
+  const pad = (n) => String(n).padStart(2, '0');
+  const MM = pad(d.getMonth() + 1);
+  const DD = pad(d.getDate());
+  const YYYY = d.getFullYear();
+  const hh = pad(d.getHours());
+  const mm = pad(d.getMinutes());
+  const ss = pad(d.getSeconds());
+
+  return `${MM}-${DD}-${YYYY} ${hh}:${mm}:${ss}`;
+}
+
 async function fetchServiceAgentPhone(agentId, headers) {
   if (!agentId) return null;
   try {
@@ -553,22 +572,33 @@ export async function handleZohoDealsSafetySync(db, task) {
         const latitude = deal.Latitude || null;
         const longitude = deal.Longitude || null;
         const referred_by = deal.Referred_By || null;
-        const Site_Survey_Req_Date_Time = deal.Site_survey_Requested_Date_Time || null;
+        // Live API returns this as ISO (2026-09-11T16:00:00+05:30), but the
+        // original schema (from the webhook's merge-field format) stores
+        // it as 'MM-DD-YYYY HH:mm:ss'. Convert so both write paths match.
+        const rawSurveyDate = deal.Site_survey_Requested_Date_Time || null;
+        const Site_Survey_Req_Date_Time = formatToWebhookDateString(rawSurveyDate);
 
         // Direct fields — no bundling/unpacking needed here. The bundling
         // only exists on the Function 1 webhook side because of the
         // "User defined Format" template; the raw API gives these as
         // separate top-level fields already.
-        const CreatedBy = deal.Created_By || null;
+        // Created_By comes back from the live API as a lookup object
+        // { id, name, email }, but the original schema (and the webhook)
+        // always stored just the plain name string. Extract .name here so
+        // the stored structure matches — storing the raw object was a
+        // structural drift this function introduced.
+        const CreatedBy = (deal.Created_By && typeof deal.Created_By === 'object')
+          ? (deal.Created_By.name || null)
+          : (deal.Created_By || null);
         const District = deal.District || null;
         const SubDistrict = deal.Sub_District || null;
         const GoogleLocation = deal.Google_Map_Location || null;
         const postalCode = deal.Zip_Postal_Code || null;
         const country = deal.Country_Region || null;
         const leadSource = deal.Lead_Source || null;
-        const No_of_Panels = deal.No_of_Panels || null;
+        const No_of_Panels = deal.No_of_Panels != null ? String(deal.No_of_Panels) : null;
         const roofType = deal.Roof_Type || null;
-        const siteSurveyStatus = deal.Site_Survey_Status || null; // mirrors Zoho directly
+        const siteSurveyStatus = deal.Site_Survey_Status || "Not-Assigned"; // mirrors Zoho; null means not yet assigned
 
         // Technical specs
         const productType = deal.Product_Type || null;
@@ -658,9 +688,10 @@ export async function handleZohoDealsSafetySync(db, task) {
         // Build $setOnInsert without any field already present in $set —
         // Mongo rejects an update where the same path appears in both.
         // siteSurveyStatus is always in $set now (mirrors Zoho directly),
-        // so it must never appear here.
+        // so it must never appear here. assignedBy removed — it was never
+        // part of the original schema (neither the webhook nor this
+        // function actually populate it, so it shouldn't exist at all).
         const setOnInsert = {
-          assignedBy: null,
           createdAt: new Date(),
           rejections: []
         };

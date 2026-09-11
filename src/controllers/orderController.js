@@ -88,8 +88,7 @@ export const rejectOrder = async (c) => {
       surveyorNumber, 
       comment, 
       receivedAt, 
-      name, 
-      address 
+      name,  
     } = body;
 
     const targetDealId = deal_id || dealId;
@@ -107,7 +106,7 @@ export const rejectOrder = async (c) => {
       const existingDeal = await db.collection("deals").findOne(dealFilter);
 
       const resolvedDealId = existingDeal?.deal_id || (targetDealId ? String(targetDealId) : null);
-      const assignedBy = existingDeal?.assignedBy || null;
+      const assignedBy = existingDeal?.CreatedBy || null;
       const assignedAt = existingDeal?.assignedAt || null;
 
       // 2. Safe local insert in surveyor_reject with complete audit snapshot
@@ -136,18 +135,64 @@ export const rejectOrder = async (c) => {
         {
           $push: { rejections: rejectionMongoId },
           $set: {
-            siteSurveyStatus: "rejected",
+            siteSurveyStatus: "Rejected",
             updatedAt: new Date()
           },
           $unset: {
             assignedTo: "",
             assignedAt: "",
-            assignedBy: ""
+            CreatedBy: ""
           }
         }
       );
 
       console.log(`🔄 Deal updated to status: rejected, assignment cleared. Matched: ${dealUpdateResult.matchedCount}, Modified: ${dealUpdateResult.modifiedCount}`);
+
+      // 3b. 🔗 Push the same "Rejected" status straight to Zoho CRM, so Zoho
+      // isn't left showing stale status while only Mongo knows about the
+      // rejection. This is what closes the gap with the safety sync —
+      // without this, the sync would see Zoho's Site_Survey_Status still
+      // unchanged and could overwrite our local "Rejected" back to
+      // whatever Zoho still had. Non-blocking: if Zoho's update fails, we
+      // still return success locally (the rejection itself is recorded
+      // either way), but we surface a warning so it can be retried/fixed.
+      let zohoSyncWarning = null;
+      if (resolvedDealId) {
+        try {
+          const zohoToken = await getZohoAccessToken(db);
+
+          const zohoPayload = {
+            data: [
+              {
+                id: String(resolvedDealId),
+                Site_Survey_Status: "Rejected"
+              }
+            ]
+          };
+
+          const zohoResponse = await fetch(`https://www.zohoapis.in/crm/v8/Deals/${resolvedDealId}`, {
+            method: "PUT",
+            headers: {
+              "Authorization": `Zoho-oauthtoken ${zohoToken}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify(zohoPayload)
+          });
+
+          if (!zohoResponse.ok) {
+            const errTxt = await zohoResponse.text();
+            console.error("⚠️ Failed to push Rejected status to Zoho:", errTxt);
+            zohoSyncWarning = "Rejection recorded locally, but Zoho CRM status update failed. Zoho may show a stale status until this is retried.";
+          } else {
+            console.log(`📡 Zoho CRM Site_Survey_Status set to "Rejected" for deal: ${resolvedDealId}`);
+          }
+        } catch (zohoErr) {
+          console.error("⚠️ Non-blocking: Zoho status sync threw an exception:", zohoErr.message);
+          zohoSyncWarning = "Rejection recorded locally, but Zoho CRM status update failed. Zoho may show a stale status until this is retried.";
+        }
+      } else {
+        console.warn("⚠️ No resolvedDealId — skipped pushing Rejected status to Zoho.");
+      }
 
       // 4. Look up active Administrator accounts to fetch their FCM tokens
       try {
@@ -210,7 +255,8 @@ export const rejectOrder = async (c) => {
       return c.json({ 
         success: true, 
         message: "Order rejection cataloged, deal reset, and Admin notified.",
-        rejectionId: rejectionMongoId
+        rejectionId: rejectionMongoId,
+        ...(zohoSyncWarning ? { warning: zohoSyncWarning } : {})
       });
     });
   } catch (err) {
@@ -280,7 +326,7 @@ export const completeOrder = async (c) => {
 
       const resolvedDealId = existingDeal?.deal_id || (targetDealId ? String(targetDealId) : null);
       const assignedTo = surveyorNumber || existingDeal?.assignedTo || "N/A";
-      const assignedBy = existingDeal?.assignedBy || null;
+      const assignedBy = existingDeal?.CreatedBy || null;
       const assignedAt = existingDeal?.assignedAt || null;
 
       const completedTimestamp = receivedAt 
@@ -374,19 +420,19 @@ export const updateSurveyStatus = async (c) => {
 
     if (normalizedStatus === "scheduled") {
       zohoValue = "Scheduled";
-      localCleanedStatus = "scheduled";
+      localCleanedStatus = "Scheduled";
     } else if (normalizedStatus === "rejected") {
       zohoValue = "Rejected";
-      localCleanedStatus = "rejected";
+      localCleanedStatus = "Rejected";
     } else if (normalizedStatus === "completed") {
       zohoValue = "Completed";
-      localCleanedStatus = "completed";
+      localCleanedStatus = "Completed";
     } else if (normalizedStatus === "accepted") {
       zohoValue = "Accepted";
-      localCleanedStatus = "accepted";
+      localCleanedStatus = "Accepted";
     } else if (normalizedStatus === "inprogress" || normalizedStatus === "in-progress") {
       zohoValue = "In-Progress";
-      localCleanedStatus = "inprogress"; // 🎯 Stripped down version for your frontend filter schema matrix
+      localCleanedStatus = "In-Progress"; // 🎯 Stripped down version for your frontend filter schema matrix
     }
 
     // Fallback if the requested value doesn't match your system options
@@ -962,7 +1008,7 @@ export const zohoWorkflowAssignment = async (c) => {
         comment: comment,
         referred_by: referred_by,
         Site_Survey_Req_Date_Time: Site_Survey_Req_Date_Time,
-        siteSurveyStatus: "assigned", // ⚡ Updated from "notassigned" to "assigned"
+        siteSurveyStatus: "Not-Assigned", // ⚡ Updated from "notassigned" to "assigned"
         assignedTo: surveyorNumber,
         assignedAt: new Date().toISOString(),
         updatedAt: new Date(),
@@ -1164,7 +1210,7 @@ export const zohoDealCreatedWebhook = async (c) => {
             CreatedBy: createdBy || null,
             emp_mail: emp_mail || null,
             emp_mobile: emp_mobile || null,
-            siteSurveyStatus: "unassigned",
+            siteSurveyStatus: "Not-Assigned",
             assignedTo: null,
             assignedBy: null,
             assignedAt: null,
