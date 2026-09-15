@@ -751,7 +751,7 @@ export async function handleZohoDealsSafetySync(db, task) {
     console.error("❌ Error in handleZohoDealsSafetySync:", error.message);
 
     // Unlock and retry in 5 minutes
-    await db.collection("tasks").updateOne(
+    await db.collection("jobs_queue").updateOne(
       { _id: task._id },
       {
         $set: {
@@ -766,7 +766,7 @@ export async function handleZohoDealsSafetySync(db, task) {
 
 async function rescheduleTask(db, taskId) {
   const nextRun = new Date(Date.now() + 30 * 60 * 1000);
-  await db.collection("tasks").updateOne(
+  await db.collection("jobs_queue").updateOne(
     { _id: taskId },
     {
       $set: {
