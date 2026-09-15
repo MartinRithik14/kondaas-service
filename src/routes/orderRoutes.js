@@ -6,7 +6,6 @@ const orderRoutes = new Hono();
 orderRoutes.post('/add', addOrder);
 orderRoutes.post('/zoho-deal-created', zohoDealCreatedWebhook);
 orderRoutes.post('/reject', rejectOrder);
-
 orderRoutes.post('/complete', completeOrder);
 orderRoutes.get('/all', getOrders);
 orderRoutes.get('/admin-rejections', getAdminRejections);

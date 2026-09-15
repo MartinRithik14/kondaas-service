@@ -480,15 +480,42 @@ async function fetchServiceAgentPhone(agentId, headers) {
 export async function handleZohoDealsSafetySync(db, task) {
   try {
     const isFirstRun = !task.lastRunAt;
-    console.log(
-      isFirstRun
-        ? "🚀 [First Run Detected] Pulling ALL full live deals from Zoho CRM & mapping schema..."
-        : "🔄 Running incremental 30-minute safety sync with Zoho CRM..."
-    );
 
     const zohoToken = await getZohoAccessToken(db);
 
-    const windowStart = new Date(Date.now() - 35 * 60 * 1000);
+    // 🎯 THE FIX: anchor the lookback window to task.lastRunAt (the actual
+    // last CONFIRMED successful run), not to Date.now(). If we anchor to
+    // "now", a run that was late — whether by 5 minutes or 5 hours because
+    // the server was down — silently loses everything Zoho changed before
+    // that fixed window, since Zoho would just filter those records out.
+    // Anchoring to lastRunAt means the window always reaches back exactly
+    // as far as it needs to, however long the gap actually was, which is
+    // the entire point of this function being a "safety net."
+    const NORMAL_INTERVAL_MINUTES = 30;
+    const SAFETY_BUFFER_MINUTES = 5; // same overlap cushion as before, for clock drift / slightly-early runs
+
+    let windowStart;
+    let elapsedMinutes = null;
+
+    if (isFirstRun) {
+      console.log("🚀 [First Run Detected] Pulling ALL full live deals from Zoho CRM & mapping schema...");
+    } else {
+      elapsedMinutes = (Date.now() - new Date(task.lastRunAt).getTime()) / 60000;
+
+      // Explicit checkpoint your lead asked for: compare elapsed time
+      // against the normal 30-minute cadence and log accordingly. The
+      // underlying window calculation is the same formula either way
+      // (lastRunAt - buffer) — this branch exists for visibility, so a
+      // catch-up after downtime is loud in the logs rather than silent.
+      if (elapsedMinutes > NORMAL_INTERVAL_MINUTES) {
+        console.log(`⚠️ Sync gap detected: last successful run was ${elapsedMinutes.toFixed(1)} minutes ago (expected ~${NORMAL_INTERVAL_MINUTES}). Catching up on the full gap now.`);
+      } else {
+        console.log(`🔄 Running scheduled safety sync with Zoho CRM (${elapsedMinutes.toFixed(1)} min since last run)...`);
+      }
+
+      windowStart = new Date(new Date(task.lastRunAt).getTime() - SAFETY_BUFFER_MINUTES * 60 * 1000);
+    }
+
     const headers = {
       "Authorization": `Zoho-oauthtoken ${zohoToken}`
     };
