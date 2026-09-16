@@ -434,7 +434,6 @@ export const processAllCustomersMonthlyJobs = async (db, masterJob) => {
   }
 };
 
-// Phone field API name confirmed via Service Agents Name field metadata: "Phone".
 const SERVICE_AGENT_PHONE_FIELD = "Phone";
 
 // Module API name confirmed via test endpoint: "Service_Agents"
@@ -478,19 +477,22 @@ async function fetchServiceAgentPhone(agentId, headers) {
 }
 
 export async function handleZohoDealsSafetySync(db, task) {
+  // 🎯 THE FIX: capture the run's START time right here, before any fetch
+  // or upsert happens. This — not the completion time — is what gets
+  // stored as lastRunAt on success. Why: if a deal changes in Zoho at
+  // 10:00:30, mid-run, and this run started at 10:00:00 but finishes at
+  // 10:01:00, storing the COMPLETION time (10:01) as lastRunAt means the
+  // next run's window starts AFTER that 10:00:30 change — permanently
+  // missing it if it wasn't captured in this run's own fetch. Anchoring to
+  // the START time guarantees the next run's window always reaches back to
+  // before anything that could have changed during this run's execution.
+  const runStartTime = new Date();
+
   try {
     const isFirstRun = !task.lastRunAt;
 
     const zohoToken = await getZohoAccessToken(db);
 
-    // 🎯 THE FIX: anchor the lookback window to task.lastRunAt (the actual
-    // last CONFIRMED successful run), not to Date.now(). If we anchor to
-    // "now", a run that was late — whether by 5 minutes or 5 hours because
-    // the server was down — silently loses everything Zoho changed before
-    // that fixed window, since Zoho would just filter those records out.
-    // Anchoring to lastRunAt means the window always reaches back exactly
-    // as far as it needs to, however long the gap actually was, which is
-    // the entire point of this function being a "safety net."
     const NORMAL_INTERVAL_MINUTES = 30;
     const SAFETY_BUFFER_MINUTES = 5; // same overlap cushion as before, for clock drift / slightly-early runs
 
@@ -500,7 +502,7 @@ export async function handleZohoDealsSafetySync(db, task) {
     if (isFirstRun) {
       console.log("🚀 [First Run Detected] Pulling ALL full live deals from Zoho CRM & mapping schema...");
     } else {
-      elapsedMinutes = (Date.now() - new Date(task.lastRunAt).getTime()) / 60000;
+      elapsedMinutes = (runStartTime.getTime() - new Date(task.lastRunAt).getTime()) / 60000;
 
       // Explicit checkpoint your lead asked for: compare elapsed time
       // against the normal 30-minute cadence and log accordingly. The
@@ -599,21 +601,11 @@ export async function handleZohoDealsSafetySync(db, task) {
         const latitude = deal.Latitude || null;
         const longitude = deal.Longitude || null;
         const referred_by = deal.Referred_By || null;
-        // Live API returns this as ISO (2026-09-11T16:00:00+05:30), but the
-        // original schema (from the webhook's merge-field format) stores
-        // it as 'MM-DD-YYYY HH:mm:ss'. Convert so both write paths match.
+    
         const rawSurveyDate = deal.Site_survey_Requested_Date_Time || null;
         const Site_Survey_Req_Date_Time = formatToWebhookDateString(rawSurveyDate);
 
-        // Direct fields — no bundling/unpacking needed here. The bundling
-        // only exists on the Function 1 webhook side because of the
-        // "User defined Format" template; the raw API gives these as
-        // separate top-level fields already.
-        // Created_By comes back from the live API as a lookup object
-        // { id, name, email }, but the original schema (and the webhook)
-        // always stored just the plain name string. Extract .name here so
-        // the stored structure matches — storing the raw object was a
-        // structural drift this function introduced.
+
         const CreatedBy = (deal.Created_By && typeof deal.Created_By === 'object')
           ? (deal.Created_By.name || null)
           : (deal.Created_By || null);
@@ -637,10 +629,7 @@ export async function handleZohoDealsSafetySync(db, task) {
         const solarPanel_Model = deal.Solar_Panel_Model || null;
         const solarPanelBrand = deal.Solar_Panel_Brand || null;
 
-        // Service_Agents_Name is a Lookup field -> Zoho returns { id, name }.
-        // Phone lives on the related Service Agents Name module record, so
-        // we resolve it via fetchServiceAgentPhone() below (see the
-        // SERVICE_AGENT_MODULE_API_NAME TODO at the top of this file).
+   
         const serviceAgentId = deal.Service_Agents_Name?.id || null;
         const serviceAgentName = deal.Service_Agents_Name?.name || null;
 
@@ -666,9 +655,7 @@ export async function handleZohoDealsSafetySync(db, task) {
           }
         }
 
-        // 🎯 isSurveyorAssigned still controls assignedTo/assignedAt (do we
-        // have a resolvable surveyor phone), but siteSurveyStatus now
-        // mirrors Zoho's real field directly instead of being guessed.
+
         const isSurveyorAssigned = Boolean(surveyorNumber && surveyorNumber.length >= 10);
 
         const fullDealPayload = {
@@ -712,12 +699,7 @@ export async function handleZohoDealsSafetySync(db, task) {
           fullDealPayload.assignedAt = new Date().toISOString();
         }
 
-        // Build $setOnInsert without any field already present in $set —
-        // Mongo rejects an update where the same path appears in both.
-        // siteSurveyStatus is always in $set now (mirrors Zoho directly),
-        // so it must never appear here. assignedBy removed — it was never
-        // part of the original schema (neither the webhook nor this
-        // function actually populate it, so it shouldn't exist at all).
+
         const setOnInsert = {
           createdAt: new Date(),
           rejections: []
@@ -745,12 +727,15 @@ export async function handleZohoDealsSafetySync(db, task) {
     }
 
     console.log(`✅ Deals safety sync finished. Total processed: ${totalSynced}`);
-    await rescheduleTask(db, task._id);
+    // Pass the run's START time through — this is what gets stored as
+    // lastRunAt, not whatever time it happens to be right now (which would
+    // be the completion time, the exact bug we're fixing).
+    await rescheduleTask(db, task._id, runStartTime);
 
   } catch (error) {
     console.error("❌ Error in handleZohoDealsSafetySync:", error.message);
 
-    // Unlock and retry in 5 minutes
+   
     await db.collection("jobs_queue").updateOne(
       { _id: task._id },
       {
@@ -764,7 +749,7 @@ export async function handleZohoDealsSafetySync(db, task) {
   }
 }
 
-async function rescheduleTask(db, taskId) {
+async function rescheduleTask(db, taskId, runStartTime) {
   const nextRun = new Date(Date.now() + 30 * 60 * 1000);
   await db.collection("jobs_queue").updateOne(
     { _id: taskId },
@@ -772,10 +757,10 @@ async function rescheduleTask(db, taskId) {
       $set: {
         status: "pending",
         lockedAt: null,
-        lastRunAt: new Date(),
+        lastRunAt: runStartTime, // ⚡ start time, not completion time — see comment above the runStartTime capture
         runAt: nextRun
       }
     }
   );
-  console.log(`⏰ Next safety sync scheduled at: ${nextRun.toISOString()}`);
+  console.log(`⏰ Next safety sync scheduled at: ${nextRun.toISOString()} (this run's lastRunAt locked at: ${runStartTime.toISOString()})`);
 }

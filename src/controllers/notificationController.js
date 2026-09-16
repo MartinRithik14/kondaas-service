@@ -31,15 +31,15 @@ const processWhatsAppNotification = async (notificationId) => {
       let payload = { number: formattedNumber };
 
       if (type === "text") {
-        action = "sendText/petchirajan";
+        action = "sendText/kondaas";
         payload.text = contentString;
       } else if (type === "poll") {
-        action = "sendPoll/petchirajan";
+        action = "sendPoll/kondaas";
         payload.name = contentString; // Message title of the Poll
         payload.selectableCount = 1;
         payload.values = ["1", "2", "3", "4", "5"]; // Options array
       } else {
-        action = "sendMedia/petchirajan";
+        action = "sendMedia/kondaas";
         payload = {
           ...payload,
           mediatype: "document",
