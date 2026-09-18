@@ -92,7 +92,7 @@ export const saveWhatsAppRating = async (c) => {
     }
 
     return await withDatabase(MONGODB_URI, async (db) => {
-      
+
       // 🛠️ DYNAMIC UPDATE PAYLOAD: Only update what is provided to prevent overwriting existing data
       const updateFields = {
         ratingReceivedAt: new Date()
@@ -101,28 +101,32 @@ export const saveWhatsAppRating = async (c) => {
       if (rating !== undefined && rating !== null) {
         updateFields.rating = String(rating).trim();
       }
-      
+
       if (feedback !== undefined && feedback !== null) {
         updateFields.feedback = String(feedback).trim();
       }
 
-      // 3. Update MongoDB (using $set with our dynamic fields object)
+   
       const updatedDeal = await db.collection('deals').findOneAndUpdate(
         {
           whatsappNo: mobile.trim(),
-          siteSurveyStatus: "completed" // 🎯 Safety guardrail matching your business logic
+          siteSurveyStatus: { $in: ["Completed", "completed"] },
+          rating: { $exists: false } // excludes already-rated deals from earlier visits
         },
         {
           $set: updateFields
         },
-        { returnDocument: 'after' } // Grab the latest fields so we can send the complete state to Zoho
+        {
+          sort: { completedAt: -1 }, // if multiple unrated completed deals exist, always take the newest
+          returnDocument: 'after'
+        }
       );
 
       // 4. Handle if no matching record is found in your database
       if (!updatedDeal) {
         return c.json({
           success: false,
-          message: "No active completed survey record found matching this mobile number.",
+          message: "No active completed survey record found matching this mobile number (or it may have already been rated).",
         }, 404);
       }
 
@@ -149,14 +153,14 @@ export const saveWhatsAppRating = async (c) => {
           data: [
             {
               id: zohoDealId,
-              Rating: updatedDeal.rating || "", 
-              Site_Survey_Remarks: updatedDeal.feedback || "" 
+              Rating: updatedDeal.rating || "",
+              Site_Survey_Remarks: updatedDeal.feedback || ""
             }
           ]
         };
 
         const zohoResponse = await fetch(`https://www.zohoapis.in/crm/v8/Deals`, {
-          method: "PUT", 
+          method: "PUT",
           headers: {
             "Authorization": `Zoho-oauthtoken ${zohoToken}`,
             "Content-Type": "application/json"
@@ -232,7 +236,7 @@ export const triggerScenarioNotification = async (c) => {
 
       // --- STEP 2: SCENARIO 4 HEAVY BACKGROUND TREE & POLL EXECUTION ---
       if (Number(scenarioType) === 4) {
-        
+
         // Background PDF & Sync compilation block remains isolated here
         (async () => {
           try {
@@ -246,15 +250,15 @@ export const triggerScenarioNotification = async (c) => {
 
             //Chnage this whatsapp number to deal id //
 
-            const formData = await db.collection("forms").findOne({ deal_id: deal_id || deal_id  });
+            const formData = await db.collection("forms").findOne({ deal_id: deal_id || deal_id });
 
             if (!formData) {
-              console.error(`❌ Document Generation Cancelled: No form entry found for mobile: ${deal_id}`);
+              console.error(`❌ Document Generation Cancelled: No form entry found for deal: ${deal_id}`);
               return;
             }
 
             formData.deal_id = deal_id;
-            
+
             formData.Site_Survey_Requested_Date_Time = new Date().toISOString();
 
             console.log("🛠️ Compiling Technical Survey Report PDF...");

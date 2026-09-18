@@ -43,6 +43,7 @@ import ticketRoutes from './src/routes/ticketRoutes.js';
 import referralRoutes from './src/routes/referralRoutes.js';
 import installerRoutes from './src/routes/installerRoutes.js';
 import adminRoutes from './src/routes/adminRoutes.js';
+import crashRoutes from './src/routes/crashRoutes.js';
 
 
 const app = new Hono();
@@ -64,6 +65,7 @@ app.route('/referral', referralRoutes);
 app.route('/logistic', logisticRoutes);
 app.route('/installer', installerRoutes);
 app.route('/admin', adminRoutes);
+app.route('/crash', crashRoutes);
 
 const port = 8080;
 
