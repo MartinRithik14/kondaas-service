@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s # Check for new numbers every 5 seconds
+
+scrape_configs:
+  - job_name: "kondaas-hono-app"
+    metrics_path: "/metrics"
+    static_configs:
+      # host.docker.internal allows a container inside Docker 
+      # to reach your app running directly on your host machine (laptop/PC).
+      # Replace 3000 with your app's port if it runs on a different port.
+      - targets: ["host.docker.internal:8080"]

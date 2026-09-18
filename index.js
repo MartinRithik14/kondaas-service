@@ -5,6 +5,7 @@ import { serve } from '@hono/node-server';
 import { startQueueRunner } from './src/controllers/queueEngine.js';
 import { ensureAuditLogIndexes } from "./src/utils/auditLogger.js";
 import { auditHttpMiddleware } from "./src/middleware/audit.middleware.js";
+import { metricsMiddleware } from "./src/middleware/metrics.middleware.js";
 import admin from 'firebase-admin';
 import fs from 'fs';
 
@@ -46,6 +47,8 @@ import referralRoutes from './src/routes/referralRoutes.js';
 import installerRoutes from './src/routes/installerRoutes.js';
 import adminRoutes from './src/routes/adminRoutes.js';
 import crashRoutes from './src/routes/crashRoutes.js';
+import metricsRoute from "./src/routes/metrics.route.js";
+
 
 
 const app = new Hono();
@@ -55,7 +58,7 @@ ensureAuditLogIndexes();
 
 // Mount global middleware
 app.use("*", auditHttpMiddleware);
-
+app.use("*", metricsMiddleware);
 // Routes
 app.route('/location', locationRoutes);
 app.route('/user', userRoutes);
@@ -72,6 +75,8 @@ app.route('/logistic', logisticRoutes);
 app.route('/installer', installerRoutes);
 app.route('/admin', adminRoutes);
 app.route('/crash', crashRoutes);
+app.route("/metrics", metricsRoute);
+
 
 const port = 8080;
 
