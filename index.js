@@ -3,6 +3,8 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { serve } from '@hono/node-server';
 import { startQueueRunner } from './src/controllers/queueEngine.js';
+import { ensureAuditLogIndexes } from "./src/utils/auditLogger.js";
+import { auditHttpMiddleware } from "./src/middleware/audit.middleware.js";
 import admin from 'firebase-admin';
 import fs from 'fs';
 
@@ -49,6 +51,10 @@ import crashRoutes from './src/routes/crashRoutes.js';
 const app = new Hono();
 
 app.use('*', cors());
+ensureAuditLogIndexes();
+
+// Mount global middleware
+app.use("*", auditHttpMiddleware);
 
 // Routes
 app.route('/location', locationRoutes);
@@ -79,3 +85,4 @@ serve({
 
 // 🕒 START THE BACKGROUND QUEUE RUNNER HERE 
 startQueueRunner();
+
