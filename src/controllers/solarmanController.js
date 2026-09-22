@@ -378,6 +378,14 @@ export const saveUserDetails = async (c) => {
         
         setFields["UserInfo.provider"] = activeProvider;
         setFields["UserInfo.role"] = existingUser?.UserInfo?.role || ui.role || "user";
+
+        // 📝 LOG LEVEL: Update if present in payload, preserve existing, or fallback to empty string
+        setFields["UserInfo.loglevel"] = ui.loglevel !== undefined 
+          ? ui.loglevel 
+          : (existingUser?.UserInfo?.loglevel ?? "");
+      } else if (!existingUser?.UserInfo?.loglevel) {
+        // Fallback for new documents where data.UserInfo isn't passed
+        setFields["UserInfo.loglevel"] = "";
       }
 
       // 🔄 Provider-Aware Device List Formatting

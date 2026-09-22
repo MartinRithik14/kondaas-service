@@ -4,7 +4,8 @@ const MONGODB_URI = process.env.MONGODB_URI;
 
 export const addcrash = async (c) => {
   try {
-    const data = await c.req.json();
+
+    const { data } = await c.req.json();
 
     if (!data || Object.keys(data).length === 0) {
       return c.json({ error: "Crash data is required!" }, 400);
@@ -16,7 +17,7 @@ export const addcrash = async (c) => {
         createdAt: new Date()
       };
 
-      const result = await db.collection("mobile_crash_analytics").insertOne(crashRecord);
+      const result = await db.collection("mobile_audit_log").insertOne(crashRecord);
 
       return c.json({
         success: true,
