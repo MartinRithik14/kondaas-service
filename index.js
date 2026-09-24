@@ -6,31 +6,48 @@ import { startQueueRunner } from './src/controllers/queueEngine.js';
 import { ensureAuditLogIndexes } from "./src/utils/auditLogger.js";
 import { auditHttpMiddleware } from "./src/middleware/audit.middleware.js";
 import { metricsMiddleware } from "./src/middleware/metrics.middleware.js";
+import { requireAuth } from "./src/middleware/authMiddleware.js";
 import admin from 'firebase-admin';
 import fs from 'fs';
 
-// 🔑 SAFE SERVICE ACCOUNT FALLBACK DETECTOR
+// 🔑 DYNAMIC SERVICE ACCOUNT INITIALIZATION
 let firebaseCredential;
+let detectedProjectId;
 
 try {
-  if (fs.existsSync('/app/firebase-key.json')) {
-    const rawKey = fs.readFileSync('/app/firebase-key.json', 'utf8');
-    firebaseCredential = admin.credential.cert(JSON.parse(rawKey));
-    console.log("🔑 Initializing Firebase with Direct Service Account Key File.");
+  let rawKey = null;
+
+  if (fs.existsSync('./firebase-service-account.json')) {
+    rawKey = fs.readFileSync('./firebase-service-account.json', 'utf8');
+    console.log("🔑 Using Root Service Account Key File (firebase-service-account.json).");
+  } else if (fs.existsSync('/app/firebase-key.json')) {
+    rawKey = fs.readFileSync('/app/firebase-key.json', 'utf8');
+    console.log("🔑 Using Docker Service Account Key File (/app/firebase-key.json).");
+  }
+
+  if (rawKey) {
+    const parsedKey = JSON.parse(rawKey);
+    firebaseCredential = admin.credential.cert(parsedKey);
+    // 🎯 Dynamically extract the project ID directly from the JSON file:
+    detectedProjectId = parsedKey.project_id;
   } else {
     firebaseCredential = admin.credential.applicationDefault();
-    console.log("☁️ Initializing Firebase with default Workload Identity Federation.");
+    console.log("☁️ Falling back to Workload Identity Federation.");
   }
 } catch (err) {
-  console.error("⚠️ Error parsing firebase-key.json, falling back to applicationDefault:", err.message);
+  console.error("⚠️ Error loading Firebase credentials:", err.message);
   firebaseCredential = admin.credential.applicationDefault();
 }
 
-// 🎯 Explicitly passing projectId to ensure Workload Identity targets the correct resource scope
-admin.initializeApp({
-  credential: firebaseCredential,
-  projectId: 'kondaas-5dfaa'
-});
+// 🎯 Initialize Firebase Admin with dynamic credentials and project ID
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: firebaseCredential,
+    ...(detectedProjectId ? { projectId: detectedProjectId } : {})
+  });
+  console.log(`✅ Firebase Admin initialized for project: ${detectedProjectId || 'Default'}`);
+}
+
 
 import locationRoutes from './src/routes/locationRoutes.js';
 import logisticRoutes from './src/routes/logisticRoutes.js';
@@ -49,17 +66,34 @@ import adminRoutes from './src/routes/adminRoutes.js';
 import crashRoutes from './src/routes/crashRoutes.js';
 import metricsRoute from "./src/routes/metrics.route.js";
 
-
-
 const app = new Hono();
 
 app.use('*', cors());
 ensureAuditLogIndexes();
 
-// Mount global middleware
+// 1. Observability Middlewares
 app.use("*", auditHttpMiddleware);
 app.use("*", metricsMiddleware);
-// Routes
+
+// 2. 🛡️ Global Auth Gatekeeper Middleware
+app.use("*", async (c, next) => {
+  const path = c.req.path;
+  const method = c.req.method;
+
+  // Exact public endpoints permitted without internal session headers:
+  const isMetrics = (path === '/metrics' || path === '/metrics/') && method === 'GET';
+  const isCrashLogger = (path === '/crash/add' || path.startsWith('/crash')) && method === 'POST';
+  const isUserOnboarding = path === '/solarman/user' && method === 'POST';
+
+  if (isMetrics || isCrashLogger || isUserOnboarding) {
+    return next();
+  }
+
+  // Enforce MongoDB session verification on everything else
+  return requireAuth(c, next);
+});
+
+// 3. Application Routes
 app.route('/location', locationRoutes);
 app.route('/user', userRoutes);
 app.route('/order', orderRoutes);
@@ -77,7 +111,6 @@ app.route('/admin', adminRoutes);
 app.route('/crash', crashRoutes);
 app.route("/metrics", metricsRoute);
 
-
 const port = 8080;
 
 serve({
@@ -90,4 +123,3 @@ serve({
 
 // 🕒 START THE BACKGROUND QUEUE RUNNER HERE 
 startQueueRunner();
-

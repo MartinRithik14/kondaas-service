@@ -1,6 +1,7 @@
 import { withDatabase, getSystemKeys } from '../utils/config.js';
 import { SolarParser } from '../utils/SolarParser.js';
 import { getInternalSolarmanToken } from '../utils/solarmanApi.js';
+import { verifyFirebaseToken } from '../utils/firebase.js';
 
 const SOLARMAN_BASE_URL = "https://globalapi.solarmanpv.com";
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -16,50 +17,16 @@ const getKeys = async (db) => {
 
 export const getSolarmanStations = async (c) => {
   try {
-    // 🛡️ SECURITY FEATURES: Extracted cleanly from the mobile app request headers
-    const incomingSecurityToken = c.req.header('x-auth-token');
-    const incomingDeviceId = c.req.header('x-device-id'); // 📱 Moved to headers to match pattern!
-    
-    // 🔌 Clean API Payload: Only phoneNo is needed in the body payload now
-    const { phoneNo } = await c.req.json();
-
-    if (!incomingSecurityToken) {
-      return c.json({ error: "Unauthorized: No security token provided" }, 401);
-    }
-
-    if (!incomingDeviceId) {
-      return c.json({ error: "Unauthorized: No deviceId provided in headers" }, 401);
-    }
-
-    if (!phoneNo) {
-      return c.json({ error: "phoneNo is required in the request body" }, 400);
-    }
+    // 👤 Get the verified user document directly from global requireAuth middleware
+    const user = c.get('user');
 
     return await withDatabase(MONGODB_URI, async (db) => {
-      // Fetch the full user document to cross-examine device lists and tokens
-      const user = await db.collection("userDetails").findOne({ _id: phoneNo });
-
-      if (!user) {
-        return c.json({ error: "User profile not found" }, 404);
-      }
-
-      // 🛡️ MULTI-DEVICE SECURITY CHECK: Locate target device session inside the devices list array
-      const devicesList = user.PlatformInfo?.devices || [];
-      const currentDeviceSession = devicesList.find(d => d.deviceId === incomingDeviceId);
-      const storedToken = currentDeviceSession?.authToken;
-
-      if (!storedToken || storedToken !== incomingSecurityToken) {
-        console.error(`❌ Security Alert: Token mismatch or unregistered device layout for ${phoneNo} on device ${incomingDeviceId}`);
-        return c.json({ error: "Unauthorized: Invalid security token" }, 401);
-      }
-
       // 🔐 Check for internal Solarman profile credentials to run background login
       if (!user.UserInfo?.email || !user.UserInfo?.password) {
         return c.json({ error: "Solarman credentials missing on profile" }, 404);
       }
 
       // 🔑 Generate background token session securely using profile credentials
-      
       const token = await getInternalSolarmanToken(
         db,
         user.UserInfo.email,
@@ -70,14 +37,13 @@ export const getSolarmanStations = async (c) => {
       // --- TOKEN GENERATED SECURELY: Proceed to Solarman API ---
       const { appId } = await getSystemKeys(db);
 
-      
       const response = await fetch(
         `${SOLARMAN_BASE_URL}/station/v1.0/list?appId=${appId}&language=en`,
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "Authorization": `bearer ${token}` // Secure Internal Token applied behind the scenes
+            "Authorization": `bearer ${token}`
           },
           body: JSON.stringify({ page: 1, size: 10 })
         }
@@ -152,22 +118,12 @@ export const getSolarmanDataCore = async (db, user, stationId, timeType, startTi
 
 export const getSolarmanHistory = async (c) => {
   try {
-    // 🛡️ SECURITY FEATURES: Extracted cleanly from the mobile app request headers
-    const incomingSecurityToken = c.header('x-auth-token') || c.req.header('x-auth-token');
-    const incomingDeviceId = c.header('x-device-id') || c.req.header('x-device-id'); 
-    
-    // 🔌 Clean API Payload: Only standard query filters left in the body payload
-    const { stationId, timeType, startTime, endTime, phoneNo } = await c.req.json();
+    // 👤 Verified user from global requireAuth middleware
+    const user = c.get('user');
 
-    if (!incomingSecurityToken) {
-      return c.json({ error: "Unauthorized: No security token provided" }, 401);
-    }
-    if (!incomingDeviceId) {
-      return c.json({ error: "Unauthorized: No deviceId provided in headers" }, 401);
-    }
-    if (!phoneNo) {
-      return c.json({ error: "phoneNo is required in the request body" }, 400);
-    }
+    // 🔌 Only business query filters remain in request body
+    const { stationId, timeType, startTime, endTime } = await c.req.json();
+
     if (!stationId || !timeType) {
       return c.json({ error: "Station ID and TimeType are required!" }, 400);
     }
@@ -176,27 +132,13 @@ export const getSolarmanHistory = async (c) => {
       const numStationId = Number(stationId);
       const strStationId = String(stationId);
 
-      // 🛡️ POLYMORPHIC SECURITY LOOKUP: Safe against String & Number data types
-      const user = await db.collection("userDetails").findOne({ 
-        _id: phoneNo,
-        $or: [
-          { "devicelist.id": { $in: [numStationId, strStationId] } },
-          { "devicelist.stationId": { $in: [numStationId, strStationId] } }
-        ]
-      });
+      // Verify the station belongs to this authenticated user's devicelist
+      const hasStation = (user.devicelist || []).some(
+        d => String(d.id) === strStationId || String(d.stationId) === strStationId
+      );
 
-      if (!user) {
-        return c.json({ error: "Unauthorized: Invalid profile or unlinked station" }, 401);
-      }
-
-      // 🛡️ MULTI-DEVICE SECURITY CHECK: Scan active device tracking array list using header ID
-      const devicesList = user.PlatformInfo?.devices || [];
-      const currentDeviceSession = devicesList.find(d => d.deviceId === incomingDeviceId);
-      const storedToken = currentDeviceSession?.authToken;
-
-      if (!storedToken || storedToken !== incomingSecurityToken) {
-        console.error(`❌ Security Alert: Token mismatch for user: ${phoneNo}, device: ${incomingDeviceId}`);
-        return c.json({ error: "Unauthorized: Invalid security token configuration" }, 401);
+      if (!hasStation) {
+        return c.json({ error: "Unauthorized: Station not linked to your profile" }, 403);
       }
 
       // 🔐 Check for internal Solarman profile credentials
@@ -290,6 +232,26 @@ export const getSolarmanHistory = async (c) => {
   }
 };
 
+export const getUser = async (c) => {
+  try {
+    // 👤 The authenticated user document is already loaded into context
+    const user = c.get('user');
+
+    return c.json({
+      success: true,
+      data: {
+        email: user.UserInfo?.email,
+        password: user.UserInfo?.password,
+        role: user.UserInfo?.role || "user",
+        provider: user.UserInfo?.provider || "solarman"
+      }
+    });
+  } catch (err) {
+    console.error("❌ Error in getUser:", err.message);
+    return c.json({ error: err.message }, 500);
+  }
+};
+
 
 export const saveUserDetails = async (c) => {
   try {
@@ -312,6 +274,17 @@ export const saveUserDetails = async (c) => {
     }
     if (!deviceId) {
       return c.json({ error: "Device ID is required for session tracking" }, 400);
+    }
+
+    // 🔒 FIREBASE TOKEN VERIFICATION
+    let decodedToken;
+    try {
+      decodedToken = await verifyFirebaseToken(incomingSecurityToken);
+    } catch (authError) {
+      return c.json({ 
+        error: "Unauthorized: Invalid or expired Firebase security token !!!!", 
+        details: authError.message 
+      }, 401);
     }
 
     return await withDatabase(MONGODB_URI, async (db) => {
@@ -438,76 +411,7 @@ export const saveUserDetails = async (c) => {
   }
 };
 
-/**
- * 2. Get User Profile with Device Session Authorization
- * Returns credentials along with the assigned provider (solarman, deye, solis)
- */
-export const getUser = async (c) => {
-  try {
-    const incomingToken = c.req.header('x-auth-token');
-    const incomingDeviceId = c.req.header('x-device-id');
-    
-    const { phoneNo } = await c.req.json();
 
-    if (!phoneNo) {
-      return c.json({ error: "phoneNo is required in the request body" }, 400);
-    }
-
-    if (!incomingToken) {
-      return c.json({ error: "Unauthorized: No security token provided" }, 401);
-    }
-
-    if (!incomingDeviceId) {
-      return c.json({ error: "Unauthorized: No deviceId provided in headers" }, 401);
-    }
-
-    return await withDatabase(MONGODB_URI, async (db) => {
-      // Fetch user with targeted projection including provider field
-      const user = await db.collection("userDetails").findOne(
-        { _id: phoneNo },
-        { 
-          projection: { 
-            "UserInfo.email": 1, 
-            "UserInfo.password": 1, 
-            "UserInfo.role": 1,
-            "UserInfo.provider": 1,
-            "UserInfo.name": 1,
-            "UserInfo.state": 1,
-            "PlatformInfo.devices": 1 
-          } 
-        }
-      );
-
-      if (!user) {
-        return c.json({ error: "User profile not found" }, 404);
-      }
-
-      // 🛡️ MULTI-DEVICE SECURITY CHECK: Verify header-extracted deviceId & token
-      const devicesList = user.PlatformInfo?.devices || [];
-      const currentDeviceSession = devicesList.find(d => d.deviceId === incomingDeviceId);
-      const storedToken = currentDeviceSession?.authToken;
-
-      if (!storedToken || storedToken !== incomingToken) {
-        console.error(`❌ Security Alert: Token mismatch for ${phoneNo} on device ${incomingDeviceId}`);
-        return c.json({ error: "Unauthorized: Invalid security token" }, 401);
-      }
-
-      // ✅ SUCCESS: Send back credentials along with provider
-      return c.json({
-        success: true,
-        data: {
-          email: user.UserInfo?.email,
-          password: user.UserInfo?.password,
-          role: user.UserInfo?.role || "user",
-          provider: user.UserInfo?.provider || "solarman" // "solarman" | "deye" | "solis"
-        }
-      });
-    });
-  } catch (err) {
-    console.error("❌ Error in getUser:", err.message);
-    return c.json({ error: err.message }, 500);
-  }
-};
 
 export const seedTariffSlabs = async (c) => {
   try {
