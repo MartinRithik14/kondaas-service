@@ -84,8 +84,13 @@ app.use("*", async (c, next) => {
   const isMetrics = (path === '/metrics' || path === '/metrics/') && method === 'GET';
   const isCrashLogger = (path === '/crash/add' || path.startsWith('/crash')) && method === 'POST';
   const isUserOnboarding = path === '/solarman/user' && method === 'POST';
+  const isZohoWebhook = (
+    path === '/order/zoho-assign' ||
+    path === '/order/zoho-deal-created' ||
+    path === '/order/webhook'
+  ) && method === 'POST';
 
-  if (isMetrics || isCrashLogger || isUserOnboarding) {
+  if (isMetrics || isCrashLogger || isUserOnboarding || isZohoWebhook) {
     return next();
   }
 
