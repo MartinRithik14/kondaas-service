@@ -3,3 +3,4 @@ node_modules
 firebase-key.json
 docker-compose.yml
 prometheus.yml
+firebase-service-account.json

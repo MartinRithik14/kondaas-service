@@ -6,3 +6,4 @@ npm-debug.log
 firebase-key.json
 docker-compose.yml
 prometheus.yml
+firebase-service-account.json
