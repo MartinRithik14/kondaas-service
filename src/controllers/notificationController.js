@@ -8,7 +8,7 @@ import fs from 'fs';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
-const processWhatsAppNotification = async (notificationId) => {
+export const processWhatsAppNotification = async (notificationId) => {
   try {
     await withDatabase(MONGODB_URI, async (db) => {
       const keys = await getSystemKeys(db);
@@ -232,7 +232,7 @@ export const triggerScenarioNotification = async (c) => {
         status: "pending",
         createdAt: new Date()
       });
-     // processWhatsAppNotification(textResult.insertedId).catch(err => console.error(err));
+      processWhatsAppNotification(textResult.insertedId).catch(err => console.error(err));
 
       // --- STEP 2: SCENARIO 4 HEAVY BACKGROUND TREE & POLL EXECUTION ---
       if (Number(scenarioType) === 4) {

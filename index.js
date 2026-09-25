@@ -84,13 +84,14 @@ app.use("*", async (c, next) => {
   const isMetrics = (path === '/metrics' || path === '/metrics/') && method === 'GET';
   const isCrashLogger = (path === '/crash/add' || path.startsWith('/crash')) && method === 'POST';
   const isUserOnboarding = path === '/solarman/user' && method === 'POST';
-  const isZohoWebhook = (
+  const isWebhook = (
     path === '/order/zoho-assign' ||
     path === '/order/zoho-deal-created' ||
-    path === '/order/webhook'
+    path === '/order/webhook'||
+    path==='/logistic/dispatch-webhook'
   ) && method === 'POST';
 
-  if (isMetrics || isCrashLogger || isUserOnboarding || isZohoWebhook) {
+  if (isMetrics || isCrashLogger || isUserOnboarding || isWebhook) {
     return next();
   }
 

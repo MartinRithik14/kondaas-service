@@ -1,8 +1,9 @@
-import { withDatabase } from '../utils/config.js'; 
+import { withDatabase,Binary } from '../utils/config.js'; 
 import fs from 'fs';
 import path from 'path';
 import { getZohoAccessToken } from '../utils/zohoAuth.js';
 import { uploadToZohoWorkDrive, getOrCreateLeadsSEFolder } from '../utils/uploadToZohoWorkDrive.js';
+import {processWhatsAppNotification} from './notificationController.js';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
@@ -576,17 +577,17 @@ export const updateDispatchOrPackageStatus = async (c) => {
         return c.json({ error: `Invalid package status: '${status}'. Must be: packed, shipped, delivered` }, 400);
       }
     } else {
-      if (normalized === "ready-to-ship" || normalized === "readytoship") {
-        zohoValue = "Ready to Ship";
-        localCleanedStatus = "ready_to_ship";
-      } else if (normalized === "shipped") {
-        zohoValue = "Shipped";
-        localCleanedStatus = "shipped";
-      } else if (normalized === "delivered") {
+      if (normalized === "accepted" || normalized === "Accepted") {
+        zohoValue = "Accepted";
+        localCleanedStatus = "accepted";
+      } else if (normalized === "picked" || normalized === "Picked") {
+        zohoValue = "Picked";
+        localCleanedStatus = "picked";
+      } else if (normalized === "delivered"|| normalized === "Delivered") {
         zohoValue = "Delivered";
         localCleanedStatus = "delivered";
       } else {
-        return c.json({ error: `Invalid dispatch status: '${status}'. Must be: ready to ship, shipped, delivered` }, 400);
+        return c.json({ error: `Invalid dispatch status: '${status}'. Must be: accepted, shipped, delivered` }, 400);
       }
     }
 
@@ -734,7 +735,23 @@ export const updateDispatchOrPackageStatus = async (c) => {
 
 
 
-//waiting to be used - dependency on Kondaas team
+const formatZohoUrl = (val) => {
+  if (!val || typeof val !== 'string') return null;
+  const trimmed = val.trim();
+  if (!trimmed) return null;
+  
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+  
+  // If it's a raw WorkDrive folder/resource ID, construct a standard WorkDrive URL
+  if (/^[a-zA-Z0-9_-]+$/.test(trimmed)) {
+    return `https://workdrive.zoho.in/folder/${trimmed}`;
+  }
+
+  return `https://${trimmed}`;
+};
+
 export const uploadPackageDeliveryPhotos = async (c) => {
   const tempFilePaths = [];
 
@@ -743,27 +760,30 @@ export const uploadPackageDeliveryPhotos = async (c) => {
     const body = await c.req.parseBody();
     const deal_id = body['deal_id'] || body['crm_deal_id'];
     const package_number = body['package_number'];
-    const dispatch_number = body['dispatch_number']; // Optional: helps locate doc faster in Mongo
+    const dispatch_number = body['dispatch_number'];
     const state = body['state'] || 'Default';
+    const delivery_date = body['delivery_date'] || null;
 
-    if (!deal_id || !package_number) {
+    if (!deal_id || !package_number || !state) {
       return c.json({
-        error: "Validation Error: 'deal_id' and 'package_number' are required fields."
+        error: "Validation Error: 'deal_id', 'package_number', and 'state' are required fields."
       }, 400);
     }
 
-    // Collect uploaded photo files (supports single or multiple file fields)
-    const files = [];
+    // Collect incoming file objects with their matching frontend field keys
+    const incomingFiles = [];
     for (const key of Object.keys(body)) {
       const val = body[key];
-      // Hono / standard file buffer check
       if (val && typeof val === 'object' && (val.arrayBuffer || val instanceof Blob || val.name)) {
-        files.push(val);
+        incomingFiles.push({
+          fieldKey: key, // e.g. 'deliveryPhoto', 'chequePhoto', etc.
+          file: val
+        });
       }
     }
 
-    if (files.length === 0) {
-      return c.json({ error: "Validation Error: No photo files found in the request." }, 400);
+    if (incomingFiles.length === 0) {
+      return c.json({ error: "Validation Error: No photo/signature files found in the request." }, 400);
     }
 
     return await withDatabase(MONGODB_URI, async (db) => {
@@ -771,62 +791,145 @@ export const uploadPackageDeliveryPhotos = async (c) => {
 
       // 2. Resolve / Create the "Package" subfolder under the Deal ID in WorkDrive
       console.log(`📁 Resolving WorkDrive "Package" folder for Deal ID [${deal_id}] in [${state}]...`);
-      const targetPackageFolderId = await getOrCreateLeadsSEFolder(deal_id, "Package", state);
+      const targetPackageFolder = await getOrCreateLeadsSEFolder(deal_id, "Package", state);
+      
+      const targetFolderId = typeof targetPackageFolder === 'object' ? targetPackageFolder.id : targetPackageFolder;
+      const targetFolderUrl = typeof targetPackageFolder === 'object' 
+        ? (targetPackageFolder.url || targetPackageFolder.permalink) 
+        : null;
 
-      const uploadedFilesResults = [];
+      const uploadedResultsMap = {};
+      const uploadedFilesList = [];
 
-      // 3. Write each file to temp disk, upload to WorkDrive, and cleanup
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        const originalName = file.name || `delivery_${Date.now()}_${i + 1}.jpg`;
-        const sanitizedExt = path.extname(originalName) || '.jpg';
-        const fileName = `${package_number}_delivery_${Date.now()}_${i + 1}${sanitizedExt}`;
-        const tempPath = path.join(process.cwd(), fileName);
+      // 3. Write each file using ONLY the clean frontend key name, upload to WorkDrive, and collect URLs
+      for (const item of incomingFiles) {
+        const { fieldKey, file } = item;
+        
+        // Preserve original extension (.jpg, .png) or assign proper default
+        const ext = path.extname(file.name || '') || (fieldKey.toLowerCase().includes('signature') ? '.png' : '.jpg');
+        const fileName = `${fieldKey}${ext}`;
+        const tempPath = path.join(process.cwd(), `${Date.now()}_${fileName}`);
 
         tempFilePaths.push(tempPath);
 
-        // Convert Blob/File to local Buffer
         const arrayBuffer = await file.arrayBuffer();
         await fs.promises.writeFile(tempPath, Buffer.from(arrayBuffer));
 
-        console.log(`⬆️ Uploading ${fileName} to WorkDrive folder [${targetPackageFolderId}]...`);
-        const uploadResult = await uploadToZohoWorkDrive(tempPath, fileName, targetPackageFolderId);
-        uploadedFilesResults.push(uploadResult);
+        console.log(`⬆️ Uploading [${fieldKey}] -> ${fileName} to WorkDrive folder [${targetFolderId}]...`);
+        const uploadResult = await uploadToZohoWorkDrive(tempPath, fileName, targetFolderId);
+
+        // Check url, permalink, or download_url depending on WorkDrive response object
+        const resolvedFileUrl = uploadResult?.url || uploadResult?.permalink || uploadResult?.download_url || uploadResult?.link || "";
+
+        uploadedResultsMap[fieldKey] = resolvedFileUrl;
+        uploadedFilesList.push({
+          key: fieldKey,
+          fileName,
+          url: resolvedFileUrl
+        });
       }
 
-      // 4. Construct the Final Shareable Link
-      // If single file: use file permalink; if multiple files: link to the WorkDrive "Package" subfolder
-      let finalPhotosUrl = "";
-      if (uploadedFilesResults.length === 1) {
-        finalPhotosUrl = uploadedFilesResults[0].url;
-      } else {
-        // If multiple photos, provide the first file link or the folder URL
-        finalPhotosUrl = uploadedFilesResults[0].url; 
-      }
+      // 4. Construct Safe Permalinks for Zoho CRM
+      const mainDeliveryPhotoUrl = uploadedResultsMap['deliveryPhoto'] || uploadedFilesList[0]?.url || "";
+      
+      // Specifically target chequePhoto or any variant containing 'cheque'
+      const chequeKey = Object.keys(uploadedResultsMap).find(k => k.toLowerCase().includes('cheque')) || 'chequePhoto';
+      const rawChequePhotoUrl = uploadedResultsMap[chequeKey] || null;
+
+      const resolvedFolderLink = targetFolderUrl || mainDeliveryPhotoUrl || targetFolderId;
+      const finalDeliveryFolderUrl = formatZohoUrl(resolvedFolderLink);
+      const finalChequePhotoUrl = formatZohoUrl(rawChequePhotoUrl);
+
+      console.log(`📸 Cheque Key Detected: [${chequeKey}] | Extracted URL: [${rawChequePhotoUrl}]`);
+      console.log(`🔗 Formatted Delivery_Folder URL: ${finalDeliveryFolderUrl}`);
+      console.log(`🔗 Formatted Cheque_Photo_Link URL: ${finalChequePhotoUrl}`);
 
       // 5. Update Zoho Creator Package Record
-      console.log(`📡 Updating Zoho Creator Package [${package_number}] with delivery photo link...`);
+      console.log(`📡 Updating Zoho Creator Package [${package_number}]...`);
       let creatorUpdated = false;
       let creatorError = null;
-
       try {
         await updateCreatorRecord(
           PACKAGES_REPORT_NAME,
           "Package_Number",
           package_number,
           {
-            Package_Delivery_Photos: finalPhotosUrl
+            Package_Delivery_Photos: mainDeliveryPhotoUrl
           },
           zohoToken
         );
         creatorUpdated = true;
-        console.log(`✅ Zoho Creator Package [${package_number}] updated successfully.`);
+        console.log(`✅ Zoho Creator Package [${package_number}] updated.`);
       } catch (err) {
         console.error(`❌ Creator Package Delivery Photos Update Failed:`, err.message);
         creatorError = err.message;
       }
 
-      // 6. Update MongoDB dispatches collection
+      // 6. Update Zoho CRM Deals Record
+      console.log(`📡 Transmitting Delivery Update to Zoho CRM Deals for record ID: ${deal_id}...`);
+      let crmDealUpdated = false;
+      let crmDealError = null;
+
+      try {
+        const dealRecordPayload = {
+          id: String(deal_id),
+          Delivery_Status: "Completed"
+        };
+
+        if (finalDeliveryFolderUrl) {
+          dealRecordPayload.Delivery_Folder = finalDeliveryFolderUrl;
+        }
+
+        // Attach Cheque_Photo_Link if a valid link exists
+        if (finalChequePhotoUrl) {
+          dealRecordPayload.Cheque_Photo_Link = finalChequePhotoUrl;
+        }
+
+        if (delivery_date) {
+          dealRecordPayload.Delivery_Date = delivery_date;
+        }
+
+        console.log("📤 Sending Zoho Deal Payload:", JSON.stringify(dealRecordPayload));
+
+        const zohoDealResponse = await fetch(`https://www.zohoapis.in/crm/v8/Deals/${deal_id}`, {
+          method: "PUT",
+          headers: {
+            "Authorization": `Zoho-oauthtoken ${zohoToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ data: [dealRecordPayload] })
+        });
+
+        if (!zohoDealResponse.ok) {
+          const errTxt = await zohoDealResponse.text();
+          console.error("❌ Zoho CRM Deals Update execution failed:", errTxt);
+          crmDealError = errTxt;
+        } else {
+          const dealResult = await zohoDealResponse.json();
+          console.log("✅ Zoho CRM Deals Server Response:", JSON.stringify(dealResult));
+          crmDealUpdated = true;
+        }
+      } catch (err) {
+        console.error("❌ Zoho CRM Deal Update Exception:", err.message);
+        crmDealError = err.message;
+      }
+
+      // 7. Update MongoDB "deals" collection
+      await db.collection("deals").updateOne(
+        { deal_id: String(deal_id) },
+        {
+          $set: {
+            deliveryStatus: "Completed",
+            deliveryFolder: finalDeliveryFolderUrl,
+            chequePhotoLink: finalChequePhotoUrl,
+            deliveryDate: delivery_date,
+            deliveryPhotosUploadedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          }
+        }
+      );
+
+      // 8. Update MongoDB "dispatches" collection
       const dispatchesColl = db.collection("dispatches");
       const mongoFilter = dispatch_number 
         ? { dispatch_number, "packages.package_number": package_number }
@@ -836,8 +939,12 @@ export const uploadPackageDeliveryPhotos = async (c) => {
         mongoFilter,
         {
           $set: {
-            "packages.$.delivery_photos_url": finalPhotosUrl,
-            "packages.$.delivery_photos_count": uploadedFilesResults.length,
+            "packages.$.delivery_status": "Completed",
+            "packages.$.delivery_folder_url": finalDeliveryFolderUrl,
+            "packages.$.delivery_photos_url": mainDeliveryPhotoUrl,
+            "packages.$.cheque_photo_url": finalChequePhotoUrl,
+            "packages.$.delivery_date": delivery_date,
+            "packages.$.uploaded_files": uploadedResultsMap,
             "packages.$.photos_uploaded_at": new Date().toISOString(),
             updatedAt: new Date().toISOString()
           }
@@ -846,13 +953,17 @@ export const uploadPackageDeliveryPhotos = async (c) => {
 
       return c.json({
         success: true,
-        message: `Delivery photos successfully uploaded and attached to Package [${package_number}].`,
+        message: `Delivery documentation and photos processed for Deal [${deal_id}] / Package [${package_number}].`,
         deal_id,
         package_number,
-        package_delivery_photos: finalPhotosUrl,
-        uploaded_count: uploadedFilesResults.length,
+        delivery_folder: finalDeliveryFolderUrl,
+        cheque_photo_link: finalChequePhotoUrl,
+        delivery_date,
+        uploaded_files: uploadedResultsMap,
         creator_synced: creatorUpdated,
-        creator_error: creatorError
+        creator_error: creatorError,
+        crm_deal_synced: crmDealUpdated,
+        crm_deal_error: crmDealError
       });
     });
 
@@ -868,5 +979,132 @@ export const uploadPackageDeliveryPhotos = async (c) => {
         });
       }
     }
+  }
+};
+
+
+
+
+export const triggerDeliveryNotification = async (c) => {
+  try {
+    const { 
+      customerMobile, 
+      name, 
+      scenarioType, 
+      eta, 
+      mapsUrl, 
+      driverNumber 
+    } = await c.req.json();
+
+    if (!customerMobile || !scenarioType) {
+      return c.json({
+        error: "Validation Error: 'customerMobile' and 'scenarioType' are required."
+      }, 400);
+    }
+
+    // Sanitize phone number (strip non-digits and leading 91)
+    let cleanedCustomerMobile = String(customerMobile).replace(/\D/g, '');
+    if (cleanedCustomerMobile.length === 12 && cleanedCustomerMobile.startsWith('91')) {
+      cleanedCustomerMobile = cleanedCustomerMobile.substring(2);
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      const whatsappTo = cleanedCustomerMobile;
+
+      // 1. Build Scenario Messages
+      let messageText = "";
+
+      switch (Number(scenarioType)) {
+        case 1: {
+          // Despatched
+          let extraDetails = [];
+          if (eta !== undefined && eta !== null && eta !== "") {
+            extraDetails.push(`⏱️ Estimated Arrival: ~${eta} mins`);
+          }
+          if (driverNumber) {
+            extraDetails.push(`📞 Driver Contact: ${driverNumber}`);
+          }
+          if (mapsUrl) {
+            extraDetails.push(`📍 Track Location: ${mapsUrl}`);
+          }
+
+          messageText = `Dear Customer, your solar power generating system has been dispatched and will be arriving soon.`;
+          if (extraDetails.length > 0) {
+            messageText += `\n\n${extraDetails.join('\n')}`;
+          }
+          break;
+        }
+
+        case 2: {
+          // Arrived
+          messageText = `Dear Customer, your solar power generating system has arrived.`;
+          break;
+        }
+
+        case 3: {
+          // Delivered
+          messageText = `Dear Customer, your solar power generating system has been successfully delivered.`;
+          break;
+        }
+
+        case 4: {
+          // Feedback
+          messageText = `Dear Customer, we hope you are satisfied with our service. Please share your valuable feedback with us. Your feedback helps us improve our service.`;
+          break;
+        }
+
+        default:
+          return c.json({
+            error: "Validation Error: 'scenarioType' must be 1 (Despatched), 2 (Arrived), 3 (Delivered), or 4 (Feedback)."
+          }, 400);
+      }
+
+      // 2. Queue and Fire the Text Message
+      const textResult = await db.collection("notifications").insertOne({
+        from: "Kondaas_Logistics",
+        to: whatsappTo,
+        mode: "whatsapp",
+        content: new Binary(Buffer.from(messageText, 'utf8')),
+        contentType: "text",
+        status: "pending",
+        createdAt: new Date()
+      });
+
+      // Dispatch via existing worker
+      processWhatsAppNotification(textResult.insertedId).catch(err => 
+        console.error("❌ Failed to process delivery text notification:", err.message)
+      );
+
+      // 3. For Scenario 4 (Feedback): Automatically Fire the Rating Poll
+      let pollNotificationId = null;
+      if (Number(scenarioType) === 4) {
+        const pollResult = await db.collection("notifications").insertOne({
+          from: "Kondaas_Logistics",
+          to: whatsappTo,
+          mode: "whatsapp",
+          content: new Binary(Buffer.from("Rate our delivery service", 'utf8')),
+          contentType: "poll",
+          status: "pending",
+          createdAt: new Date()
+        });
+
+        pollNotificationId = pollResult.insertedId;
+
+        processWhatsAppNotification(pollResult.insertedId).catch(err => 
+          console.error("❌ Failed to process delivery poll notification:", err.message)
+        );
+      }
+
+      return c.json({
+        success: true,
+        message: `Delivery Scenario ${scenarioType} notification sent successfully.`,
+        notificationId: textResult.insertedId,
+        pollNotificationId: pollNotificationId
+      });
+    });
+
+  } catch (err) {
+    console.error("❌ triggerDeliveryNotification Error:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
   }
 };
