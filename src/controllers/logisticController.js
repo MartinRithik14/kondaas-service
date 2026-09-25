@@ -988,8 +988,7 @@ export const uploadPackageDeliveryPhotos = async (c) => {
 export const triggerDeliveryNotification = async (c) => {
   try {
     const { 
-      customerMobile, 
-      name, 
+      customerMobile,  
       scenarioType, 
       eta, 
       mapsUrl, 
@@ -1015,6 +1014,13 @@ export const triggerDeliveryNotification = async (c) => {
       let messageText = "";
 
       switch (Number(scenarioType)) {
+       
+        case 0: {
+          // Package Ready / Out for Delivery Today
+          messageText = `Dear Customer, your solar power generating system package is packed and ready. Your delivery is scheduled for today.`;
+          break;
+        }
+        
         case 1: {
           // Despatched
           let extraDetails = [];
@@ -1055,7 +1061,7 @@ export const triggerDeliveryNotification = async (c) => {
 
         default:
           return c.json({
-            error: "Validation Error: 'scenarioType' must be 1 (Despatched), 2 (Arrived), 3 (Delivered), or 4 (Feedback)."
+            error: "Validation Error: 'scenarioType' must be 0 (Package Ready), 1 (Despatched), 2 (Arrived), 3 (Delivered), or 4 (Feedback)."
           }, 400);
       }
 
