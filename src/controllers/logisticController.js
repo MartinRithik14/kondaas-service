@@ -752,6 +752,67 @@ const formatZohoUrl = (val) => {
   return `https://${trimmed}`;
 };
 
+export const uploadVehicleLoadedPhoto = async (c) => {
+  let tempFilePath = null;
+
+  try {
+    const body = await c.req.parseBody();
+    const deal_id = body['deal_id'] || body['crm_deal_id'];
+    const state = body['state'] || 'Default';
+
+    if (!deal_id) {
+      return c.json({ error: "Validation Error: 'deal_id' is required." }, 400);
+    }
+
+    // Locate the photo file from formData (accepts 'vehicleLoadedPhoto', 'photo', or 'file')
+    const file = body['vehicleLoadedPhoto'] || body['photo'] || body['file'];
+
+    if (!file || typeof file !== 'object' || !(file.arrayBuffer || file instanceof Blob || file.name)) {
+      return c.json({ error: "Validation Error: No 'vehicleLoadedPhoto' file provided." }, 400);
+    }
+
+    // Resolve file extension and construct clean name
+    const ext = path.extname(file.name || '') || '.jpg';
+    const fileName = `vehicleLoadedPhoto${ext}`;
+    tempFilePath = path.join(process.cwd(), `${Date.now()}_${fileName}`);
+
+    // Write file temporarily to disk
+    const arrayBuffer = await file.arrayBuffer();
+    await fs.promises.writeFile(tempFilePath, Buffer.from(arrayBuffer));
+
+    // Resolve the WorkDrive "Package" folder for this deal
+    console.log(`📁 Resolving WorkDrive "Package" folder for Deal ID [${deal_id}] in [${state}]...`);
+    const targetPackageFolder = await getOrCreateLeadsSEFolder(deal_id, "Package", state);
+    const targetFolderId = typeof targetPackageFolder === 'object' ? targetPackageFolder.id : targetPackageFolder;
+
+    // Upload strictly to WorkDrive
+    console.log(`⬆️ Uploading ${fileName} to WorkDrive folder [${targetFolderId}]...`);
+    const uploadResult = await uploadToZohoWorkDrive(tempFilePath, fileName, targetFolderId);
+
+    const fileUrl = uploadResult?.url || uploadResult?.permalink || uploadResult?.download_url || uploadResult?.link || "";
+
+    return c.json({
+      success: true,
+      message: `Vehicle loaded photo uploaded successfully to Deal [${deal_id}] WorkDrive package folder.`,
+      deal_id,
+      fileName,
+      url: fileUrl
+    });
+
+  } catch (err) {
+    console.error("❌ Upload Vehicle Loaded Photo Error:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
+  } finally {
+    // Cleanup temporary local file
+    if (tempFilePath && fs.existsSync(tempFilePath)) {
+      fs.unlink(tempFilePath, (err) => {
+        if (err) console.error("⚠️ Cleanup error for file:", tempFilePath, err.message);
+      });
+    }
+  }
+};
+
+
 export const uploadPackageDeliveryPhotos = async (c) => {
   const tempFilePaths = [];
 
