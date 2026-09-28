@@ -8,6 +8,64 @@ import fs from 'fs';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
+//Interakt API for WhatsApp notifications
+const resolveInteraktTemplate = (notification, contentString) => {
+  // 1. If explicitly queued with Interakt metadata:
+  if (notification.templateName) {
+    return {
+      templateName: notification.templateName,
+      bodyValues: notification.bodyValues || []
+    };
+  }
+
+  // 2. Fallback resolution for poll ratings:
+  if (notification.contentType === "poll") {
+    // If it's a delivery poll vs surveyor poll:
+    const isDelivery = notification.context === "delivery" || contentString.toLowerCase().includes("delivery");
+    return {
+      templateName: isDelivery ? "delivery_feedback_rating" : "surveyor_feedback_rating",
+      bodyValues: [notification.customerName || "Customer"]
+    };
+  }
+
+  // 3. Optional: Map known text patterns if templateName was not attached at queue time
+  return null;
+};
+
+
+const sendViaInterakt = async ({ interaktConfig, to, templateName, bodyValues = [], languageCode = "en" }) => {
+  const url = interaktConfig.apiUrl || "https://api.interakt.ai/v1/public/message/";
+  const payload = {
+    countryCode: "+91",
+    phoneNumber: String(to).replace(/^\+?91/, ""),
+    type: "Template",
+    template: {
+      name: templateName,
+      
+      languageCode: languageCode, // Try "en_US" if "en" fails after sync
+      bodyValues
+    }
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Basic ${interaktConfig.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Interakt API Error ${res.status}: ${errText}`);
+  }
+
+  return await res.json();
+};
+
+
+
 export const processWhatsAppNotification = async (notificationId) => {
   try {
     await withDatabase(MONGODB_URI, async (db) => {
@@ -17,16 +75,15 @@ export const processWhatsAppNotification = async (notificationId) => {
       const notification = await db.collection("notifications").findOneAndUpdate(
         { _id: notificationId, status: "pending" },
         { $set: { status: "processing", startedAt: new Date() } },
-        { returnDocument: 'after' }
+        { returnDocument: "after" }
       );
 
       if (!notification) return;
 
       const type = notification.contentType;
       const formattedNumber = `91${notification.to}`;
-      const contentString = notification.content.buffer.toString('utf8');
+      const contentString = notification.content.buffer.toString("utf8");
 
-      // 🔀 DYNAMIC ACTION ROUTER
       let action;
       let payload = { number: formattedNumber };
 
@@ -35,9 +92,9 @@ export const processWhatsAppNotification = async (notificationId) => {
         payload.text = contentString;
       } else if (type === "poll") {
         action = "sendPoll/kondaas";
-        payload.name = contentString; // Message title of the Poll
+        payload.name = contentString;
         payload.selectableCount = 1;
-        payload.values = ["1", "2", "3", "4", "5"]; // Options array
+        payload.values = ["1", "2", "3", "4", "5"];
       } else {
         action = "sendMedia/kondaas";
         payload = {
@@ -49,28 +106,70 @@ export const processWhatsAppNotification = async (notificationId) => {
         };
       }
 
-      const response = await fetch(`${BASE_URL}${action}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "apikey": API_KEY },
-        body: JSON.stringify(payload)
-      });
+      // --- PRIMARY: TRY EVOLUTION API ---
+      let sentSuccessfully = false;
+      let usedProvider = "evolution";
 
-      if (response.ok) {
+      try {
+        const response = await fetch(`https://broken-evolution-test.invalid/${action}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "apikey": API_KEY },
+          body: JSON.stringify(payload)
+        });
+
+        if (response.ok) {
+          sentSuccessfully = true;
+        } else {
+          const errorData = await response.text();
+          console.warn(`⚠️ Evolution failed with status ${response.status}: ${errorData}. Attempting Interakt fallback...`);
+        }
+      } catch (evolutionErr) {
+        console.warn(`⚠️ Evolution network error: ${evolutionErr.message}. Attempting Interakt fallback...`);
+      }
+
+      // --- SECONDARY: FALLBACK TO INTERAKT ---
+      if (!sentSuccessfully) {
+        if (!keys.interakt || !keys.interakt.apiKey) {
+          throw new Error("Evolution failed and Interakt credentials are not configured in system_keys.");
+        }
+
+        const templateInfo = resolveInteraktTemplate(notification, contentString);
+        if (!templateInfo) {
+          throw new Error("Evolution failed and no matching Interakt template could be resolved for this notification.");
+        }
+
+        console.log(`📡 Sending fallback via Interakt template: ${templateInfo.templateName}...`);
+        await sendViaInterakt({
+          interaktConfig: keys.interakt,
+          to: notification.to,
+          templateName: templateInfo.templateName,
+          bodyValues: templateInfo.bodyValues
+        });
+
+        sentSuccessfully = true;
+        usedProvider = "interakt";
+      }
+
+      // --- RECORD SUCCESS ---
+      if (sentSuccessfully) {
         await db.collection("notifications").updateOne(
           { _id: notificationId },
-          { $set: { status: "completed", completedAt: new Date() } }
+          {
+            $set: {
+              status: "completed",
+              completedAt: new Date(),
+              providerUsed: usedProvider
+            }
+          }
         );
-      } else {
-        const errorData = await response.text();
-        throw new Error(`API Error ${response.status}: ${errorData}`);
       }
     });
   } catch (err) {
-    console.error("❌ WhatsApp Task Failed:", err.message);
+    console.error("❌ WhatsApp Task Failed Completely:", err.message);
     await withDatabase(MONGODB_URI, async (db) => {
       await db.collection("notifications").updateOne(
         { _id: notificationId },
-        { $set: { status: "failed" }, $inc: { retryCount: 1 } }
+        { $set: { status: "failed", lastError: err.message }, $inc: { retryCount: 1 } }
       );
     });
   }
@@ -204,7 +303,7 @@ export const saveWhatsAppRating = async (c) => {
 
 export const triggerScenarioNotification = async (c) => {
   try {
-    const { deal_id, surveyorNumber, customerMobile, name, scenarioType, eta, mapsUrl, state } = await c.req.json();
+    const { deal_id, surveyorNumber, customerMobile, name, scenarioType, eta, state } = await c.req.json();
 
     let cleanedCustomerMobile = customerMobile ? String(customerMobile).replace(/\D/g, '') : null;
     if (cleanedCustomerMobile && cleanedCustomerMobile.length === 12 && cleanedCustomerMobile.startsWith('91')) {
@@ -212,15 +311,38 @@ export const triggerScenarioNotification = async (c) => {
     }
 
     return await withDatabase(MONGODB_URI, async (db) => {
-      const customerName = name;
+      const customerName = name || "Customer";
       const whatsappTo = cleanedCustomerMobile;
 
+      // 1. Text message templates for Evolution API (Map URL removed from 1 to align with Interakt)
       const messages = {
-        1: `Hello ${customerName}, your Kondaas technician has started. Arrival in ${eta || 'soon'} min. Contact: ${surveyorNumber}.${mapsUrl ? `\n\n📍 Track Location: ${mapsUrl}` : ''}`,
+        1: `Hello ${customerName}, your Kondaas technician has started. Arrival in ${eta || 'soon'} min. Contact: ${surveyorNumber}.`,
         2: `Hello ${customerName}, your technician is just 300 meters away!`,
         3: `Hello ${customerName}, your technician has arrived.`,
         4: `Hello ${customerName}, your technician has completed the work. Thank you for choosing Kondaas! and kindly give rating.`
       };
+
+      // 2. Interakt fallback metadata mappings
+      const interaktTemplates = {
+        1: {
+          templateName: "surveyor_started",
+          bodyValues: [String(customerName), String(eta || "30"), String(surveyorNumber || "")]
+        },
+        2: {
+          templateName: "surveyor_nearby",
+          bodyValues: [String(customerName)]
+        },
+        3: {
+          templateName: "surveyor_arrived",
+          bodyValues: [String(customerName)]
+        },
+        4: {
+          templateName: "surveyor_completed_rating_d4",
+          bodyValues: [String(customerName)]
+        }
+      };
+
+      const fallbackMeta = interaktTemplates[scenarioType] || {};
 
       // --- STEP 1: ALWAYS SEND THE TEXT MESSAGE FIRST ---
       const textResult = await db.collection("notifications").insertOne({
@@ -229,6 +351,8 @@ export const triggerScenarioNotification = async (c) => {
         mode: "whatsapp",
         content: new Binary(Buffer.from(messages[scenarioType], 'utf8')),
         contentType: "text",
+        templateName: fallbackMeta.templateName,
+        bodyValues: fallbackMeta.bodyValues,
         status: "pending",
         createdAt: new Date()
       });
@@ -237,7 +361,6 @@ export const triggerScenarioNotification = async (c) => {
       // --- STEP 2: SCENARIO 4 HEAVY BACKGROUND TREE & POLL EXECUTION ---
       if (Number(scenarioType) === 4) {
 
-        // Background PDF & Sync compilation block remains isolated here
         (async () => {
           try {
             if (!deal_id) {
@@ -247,10 +370,7 @@ export const triggerScenarioNotification = async (c) => {
 
             console.log(`📄 Fetching forms record for clean mobile: ${cleanedCustomerMobile}...`);
 
-
-            //Chnage this whatsapp number to deal id //
-
-            const formData = await db.collection("forms").findOne({ deal_id: deal_id || deal_id });
+            const formData = await db.collection("forms").findOne({ deal_id: deal_id });
 
             if (!formData) {
               console.error(`❌ Document Generation Cancelled: No form entry found for deal: ${deal_id}`);
@@ -258,7 +378,6 @@ export const triggerScenarioNotification = async (c) => {
             }
 
             formData.deal_id = deal_id;
-
             formData.Site_Survey_Requested_Date_Time = new Date().toISOString();
 
             console.log("🛠️ Compiling Technical Survey Report PDF...");
@@ -329,20 +448,7 @@ export const triggerScenarioNotification = async (c) => {
               if (err) console.error("❌ Error deleting local temporary invoice PDF:", err.message);
             });
 
-            // 📄 Dispatch Invoice PDF Notification
-            const pdfResult = await db.collection("notifications").insertOne({
-              from: "Kondaas_System",
-              to: whatsappTo,
-              mode: "whatsapp",
-              content: new Binary(Buffer.from(finalShareableLink.trim(), 'utf8')),
-              contentType: "pdf",
-              caption: "Here is your formal invoice. Thank you!",
-              status: "pending",
-              createdAt: new Date()
-            });
-            //processWhatsAppNotification(pdfResult.insertedId).catch(err => console.error(err));//
-
-            // 📊 🎯 MOVED TO THE LAST STEP: Fire interactive satisfaction rating poll safely here!
+            // 📊 🎯 Interactive satisfaction rating poll with Interakt fallback metadata
             console.log("📊 Sending customer satisfaction rating poll feedback interface...");
             const pollResult = await db.collection("notifications").insertOne({
               from: "Kondaas_System",
@@ -350,6 +456,8 @@ export const triggerScenarioNotification = async (c) => {
               mode: "whatsapp",
               content: new Binary(Buffer.from("Rate our service", 'utf8')),
               contentType: "poll",
+              templateName: "surveyor_feedback_rating",
+              bodyValues: [String(customerName)],
               status: "pending",
               createdAt: new Date()
             });
