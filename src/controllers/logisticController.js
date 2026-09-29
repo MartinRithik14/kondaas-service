@@ -1049,14 +1049,15 @@ export const uploadPackageDeliveryPhotos = async (c) => {
 export const triggerDeliveryNotification = async (c) => {
   try {
     const { 
-      customerMobile,  
+      customerMobile, 
+      customerName, 
       scenarioType, 
       eta, 
       mapsUrl, 
       driverNumber 
     } = await c.req.json();
 
-    if (!customerMobile || !scenarioType) {
+    if (!customerMobile || scenarioType === undefined || scenarioType === null) {
       return c.json({
         error: "Validation Error: 'customerMobile' and 'scenarioType' are required."
       }, 400);
@@ -1070,15 +1071,15 @@ export const triggerDeliveryNotification = async (c) => {
 
     return await withDatabase(MONGODB_URI, async (db) => {
       const whatsappTo = cleanedCustomerMobile;
+      const resolvedCustomerName = customerName || "Customer";
 
-      // 1. Build Scenario Messages
+      // 1. Build Scenario Text Messages (for Evolution API)
       let messageText = "";
 
       switch (Number(scenarioType)) {
-       
         case 0: {
           // Package Ready / Out for Delivery Today
-          messageText = `Dear Customer, your solar power generating system package is packed and ready. Your delivery is scheduled for today.`;
+          messageText = `Dear ${resolvedCustomerName}, your solar power generating system package is packed and ready. Your delivery is scheduled for today.`;
           break;
         }
         
@@ -1095,7 +1096,7 @@ export const triggerDeliveryNotification = async (c) => {
             extraDetails.push(`📍 Track Location: ${mapsUrl}`);
           }
 
-          messageText = `Dear Customer, your solar power generating system has been dispatched and will be arriving soon.`;
+          messageText = `Dear ${resolvedCustomerName}, your solar power generating system has been dispatched and will be arriving soon.`;
           if (extraDetails.length > 0) {
             messageText += `\n\n${extraDetails.join('\n')}`;
           }
@@ -1104,19 +1105,19 @@ export const triggerDeliveryNotification = async (c) => {
 
         case 2: {
           // Arrived
-          messageText = `Dear Customer, your solar power generating system has arrived.`;
+          messageText = `Dear ${resolvedCustomerName}, your solar power generating system has arrived.`;
           break;
         }
 
         case 3: {
-          // Delivered
-          messageText = `Dear Customer, your solar power generating system has been successfully delivered.`;
+          // Delivered / Completed
+          messageText = `Dear ${resolvedCustomerName}, your solar power generating system has been successfully delivered.`;
           break;
         }
 
         case 4: {
           // Feedback
-          messageText = `Dear Customer, we hope you are satisfied with our service. Please share your valuable feedback with us. Your feedback helps us improve our service.`;
+          messageText = `Dear ${resolvedCustomerName}, we hope you are satisfied with our service. Please share your valuable feedback with us. Your feedback helps us improve our service.`;
           break;
         }
 
@@ -1126,13 +1127,47 @@ export const triggerDeliveryNotification = async (c) => {
           }, 400);
       }
 
-      // 2. Queue and Fire the Text Message
+      // 2. Interakt Fallback Mapping Table
+      const interaktDeliveryTemplates = {
+        0: {
+          templateName: "delivery_ready",
+          bodyValues: [String(resolvedCustomerName).trim()]
+        },
+        1: {
+          templateName: "delivery_despatched",
+          // Fallback protects against null/empty strings
+          bodyValues: [
+            String(resolvedCustomerName).trim(),
+            String(eta || "soon").trim(),
+            String(driverNumber || "Support").trim()
+          ]
+        },
+        2: {
+          templateName: "delivery_arrived",
+          bodyValues: [String(resolvedCustomerName).trim()]
+        },
+        3: {
+          templateName: "delivery_completed",
+          bodyValues: [String(resolvedCustomerName).trim()]
+        },
+        4: {
+          // If you have a separate text template for Scenario 4
+          templateName: "delivery_completed", 
+          bodyValues: [String(resolvedCustomerName).trim()]
+        }
+      };
+
+      const fallbackMeta = interaktDeliveryTemplates[Number(scenarioType)] || {};
+
+      // 3. Queue and Fire Primary Text Notification
       const textResult = await db.collection("notifications").insertOne({
         from: "Kondaas_Logistics",
         to: whatsappTo,
         mode: "whatsapp",
         content: new Binary(Buffer.from(messageText, 'utf8')),
         contentType: "text",
+        templateName: fallbackMeta.templateName,
+        bodyValues: fallbackMeta.bodyValues,
         status: "pending",
         createdAt: new Date()
       });
@@ -1142,7 +1177,7 @@ export const triggerDeliveryNotification = async (c) => {
         console.error("❌ Failed to process delivery text notification:", err.message)
       );
 
-      // 3. For Scenario 4 (Feedback): Automatically Fire the Rating Poll
+      // 4. For Scenario 4: Automatically Queue the Interactive Rating Poll
       let pollNotificationId = null;
       if (Number(scenarioType) === 4) {
         const pollResult = await db.collection("notifications").insertOne({
@@ -1151,6 +1186,8 @@ export const triggerDeliveryNotification = async (c) => {
           mode: "whatsapp",
           content: new Binary(Buffer.from("Rate our delivery service", 'utf8')),
           contentType: "poll",
+          templateName: "delivery_feedback_rating",
+          bodyValues: [String(resolvedCustomerName).trim()],
           status: "pending",
           createdAt: new Date()
         });
