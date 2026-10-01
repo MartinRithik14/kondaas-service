@@ -7,7 +7,7 @@ export const LogLevel = Object.freeze({
 });
 
 export const RETENTION_RULES = Object.freeze({
-  [LogLevel.INFO]: 7 * 24 * 60 * 60 * 1000,   // 7 days
+  [LogLevel.INFO]: 3 * 24 * 60 * 60 * 1000,   // 3 days
   [LogLevel.WARN]: 30 * 24 * 60 * 60 * 1000,  // 30 days
   [LogLevel.ERROR]: 90 * 24 * 60 * 60 * 1000, // 90 days
   [LogLevel.SECURITY]: null,                   // Permanent

@@ -111,7 +111,7 @@ export const processWhatsAppNotification = async (notificationId) => {
       let usedProvider = "evolution";
 
       try {
-        const response = await fetch(`https://broken-evolution-test.invalid/${action}`, {
+        const response = await fetch(`${BASE_URL}${action}`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "apikey": API_KEY },
           body: JSON.stringify(payload)

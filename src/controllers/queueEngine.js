@@ -434,11 +434,6 @@ export const processAllCustomersMonthlyJobs = async (db, masterJob) => {
   }
 };
 
-const SERVICE_AGENT_PHONE_FIELD = "Phone";
-
-// Module API name confirmed via test endpoint: "Service_Agents"
-const SERVICE_AGENT_MODULE_API_NAME = "Service_Agents";
-
 // Converts an ISO datetime (as the live Deals API returns) into the same
 // 'MM-DD-YYYY HH:mm:ss' string format the webhook's merge field produces,
 // so both write paths store this field identically.
@@ -456,24 +451,6 @@ function formatToWebhookDateString(isoString) {
   const ss = pad(d.getSeconds());
 
   return `${MM}-${DD}-${YYYY} ${hh}:${mm}:${ss}`;
-}
-
-async function fetchServiceAgentPhone(agentId, headers) {
-  if (!agentId) return null;
-  try {
-    const url = `https://www.zohoapis.in/crm/v8/${SERVICE_AGENT_MODULE_API_NAME}/${agentId}?fields=${SERVICE_AGENT_PHONE_FIELD}`;
-    const res = await fetch(url, { method: "GET", headers });
-    if (!res.ok) {
-      console.log(`⚠️ Failed to fetch Service Agent ${agentId}: ${res.status}`);
-      return null;
-    }
-    const data = await res.json();
-    const record = data?.data?.[0];
-    return record?.[SERVICE_AGENT_PHONE_FIELD] || null;
-  } catch (err) {
-    console.log(`⚠️ Error fetching Service Agent ${agentId}: ${err.message}`);
-    return null;
-  }
 }
 
 export async function handleZohoDealsSafetySync(db, task) {
@@ -535,6 +512,10 @@ export async function handleZohoDealsSafetySync(db, task) {
     // REAL Deals API names — Created_By is fetched as its own field
     // (it's Single Line text here, not a lookup), so no unbundling is
     // needed on this side; Zoho just gives us the raw fields directly.
+    // Site_Engineer_Contact added: it's a plain Phone field directly on
+    // the Deal (confirmed same as Function 1 uses), so the surveyor's
+    // number is now fetched in this SAME call — no separate API round
+    // trip to the Service Agents module needed anymore (see below).
     const fieldsToFetch = [
       "id",
       "Deal_Name",
@@ -566,7 +547,8 @@ export async function handleZohoDealsSafetySync(db, task) {
       "No_of_Panels",
       "Roof_Type",
       "Site_Survey_Status",
-      "Service_Agents_Name" // Lookup field -> returns { id, name }, not a phone number
+      "Site_Engineer_Contact", // ⚡ NEW: direct phone field, replaces the Service_Agents_Name phone lookup
+      "Service_Agents_Name" // Lookup field -> returns { id, name } — kept only for the display name now
     ].join(",");
 
     while (hasMoreRecords) {
@@ -601,7 +583,7 @@ export async function handleZohoDealsSafetySync(db, task) {
         const latitude = deal.Latitude || null;
         const longitude = deal.Longitude || null;
         const referred_by = deal.Referred_By || null;
-    
+
         const rawSurveyDate = deal.Site_survey_Requested_Date_Time || null;
         const Site_Survey_Req_Date_Time = formatToWebhookDateString(rawSurveyDate);
 
@@ -629,14 +611,21 @@ export async function handleZohoDealsSafetySync(db, task) {
         const solarPanel_Model = deal.Solar_Panel_Model || null;
         const solarPanelBrand = deal.Solar_Panel_Brand || null;
 
-   
-        const serviceAgentId = deal.Service_Agents_Name?.id || null;
+        // Service_Agents_Name is still read for its NAME only (display
+        // field, ServiceAgentName below) — the phone no longer comes from
+        // here, so there's no second API call and nothing that can fail
+        // or rate-limit on a per-deal basis anymore.
         const serviceAgentName = deal.Service_Agents_Name?.name || null;
 
+        // ⚡ THE CHANGE: surveyor phone now comes straight from
+        // Site_Engineer_Contact, already present in this same fetch —
+        // exactly the same field Function 1 (zohoWorkflowAssignment)
+        // already uses. No separate lookup, no extra request, no
+        // rate-limit risk, no cache needed.
         let surveyorNumber = null;
-        const rawAgentPhone = await fetchServiceAgentPhone(serviceAgentId, headers);
-        if (rawAgentPhone) {
-          surveyorNumber = String(rawAgentPhone).replace(/\D/g, '');
+        const rawSiteEngineerContact = deal.Site_Engineer_Contact || null;
+        if (rawSiteEngineerContact) {
+          surveyorNumber = String(rawSiteEngineerContact).replace(/\D/g, '');
           if (surveyorNumber.length === 12 && surveyorNumber.startsWith('91')) {
             surveyorNumber = surveyorNumber.substring(2);
           }
@@ -735,7 +724,7 @@ export async function handleZohoDealsSafetySync(db, task) {
   } catch (error) {
     console.error("❌ Error in handleZohoDealsSafetySync:", error.message);
 
-   
+
     await db.collection("jobs_queue").updateOne(
       { _id: task._id },
       {
