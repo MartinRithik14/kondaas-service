@@ -812,7 +812,6 @@ export const uploadVehicleLoadedPhoto = async (c) => {
   }
 };
 
-
 export const uploadPackageDeliveryPhotos = async (c) => {
   const tempFilePaths = [];
 
@@ -855,18 +854,27 @@ export const uploadPackageDeliveryPhotos = async (c) => {
       const targetPackageFolder = await getOrCreateLeadsSEFolder(deal_id, "Package", state);
       
       const targetFolderId = typeof targetPackageFolder === 'object' ? targetPackageFolder.id : targetPackageFolder;
-      const targetFolderUrl = typeof targetPackageFolder === 'object' 
-        ? (targetPackageFolder.url || targetPackageFolder.permalink) 
-        : null;
+
+      // Construct direct web navigation link for the WorkDrive folder
+      const folderWebUrl = targetFolderId ? `https://workdrive.zoho.in/folder/${targetFolderId}` : null;
 
       const uploadedResultsMap = {};
       const uploadedFilesList = [];
+
+      // Helper to transform any /download/ URL to preview /file/ URL
+      const toPreviewUrl = (url, fileId) => {
+        if (!url && fileId) return `https://workdrive.zoho.in/file/${fileId}`;
+        if (typeof url === 'string' && url.includes('/api/v1/download/')) {
+          const extractedId = url.split('/download/')[1];
+          return `https://workdrive.zoho.in/file/${extractedId}`;
+        }
+        return url;
+      };
 
       // 3. Write each file using ONLY the clean frontend key name, upload to WorkDrive, and collect URLs
       for (const item of incomingFiles) {
         const { fieldKey, file } = item;
         
-        // Preserve original extension (.jpg, .png) or assign proper default
         const ext = path.extname(file.name || '') || (fieldKey.toLowerCase().includes('signature') ? '.png' : '.jpg');
         const fileName = `${fieldKey}${ext}`;
         const tempPath = path.join(process.cwd(), `${Date.now()}_${fileName}`);
@@ -879,33 +887,35 @@ export const uploadPackageDeliveryPhotos = async (c) => {
         console.log(`⬆️ Uploading [${fieldKey}] -> ${fileName} to WorkDrive folder [${targetFolderId}]...`);
         const uploadResult = await uploadToZohoWorkDrive(tempPath, fileName, targetFolderId);
 
-        // Check url, permalink, or download_url depending on WorkDrive response object
-        const resolvedFileUrl = uploadResult?.url || uploadResult?.permalink || uploadResult?.download_url || uploadResult?.link || "";
+        // Convert download endpoint to preview web link
+        const rawUrl = uploadResult?.url || "";
+        const fileId = uploadResult?.fileId;
+        const previewUrl = toPreviewUrl(rawUrl, fileId);
 
-        uploadedResultsMap[fieldKey] = resolvedFileUrl;
+        uploadedResultsMap[fieldKey] = previewUrl;
         uploadedFilesList.push({
           key: fieldKey,
           fileName,
-          url: resolvedFileUrl
+          url: previewUrl
         });
       }
 
-      // 4. Construct Safe Permalinks for Zoho CRM
+      // 4. Construct Navigation Links for CRM
       const mainDeliveryPhotoUrl = uploadedResultsMap['deliveryPhoto'] || uploadedFilesList[0]?.url || "";
       
-      // Specifically target chequePhoto or any variant containing 'cheque'
+      // Target cheque photo or any key containing 'cheque'
       const chequeKey = Object.keys(uploadedResultsMap).find(k => k.toLowerCase().includes('cheque')) || 'chequePhoto';
       const rawChequePhotoUrl = uploadedResultsMap[chequeKey] || null;
 
-      const resolvedFolderLink = targetFolderUrl || mainDeliveryPhotoUrl || targetFolderId;
-      const finalDeliveryFolderUrl = formatZohoUrl(resolvedFolderLink);
-      const finalChequePhotoUrl = formatZohoUrl(rawChequePhotoUrl);
+      // Final Links: Folder URL strictly points to the WorkDrive folder
+      const finalDeliveryFolderUrl = folderWebUrl ? formatZohoUrl(folderWebUrl) : "";
+      const finalChequePhotoUrl = rawChequePhotoUrl ? formatZohoUrl(rawChequePhotoUrl) : null;
 
       console.log(`📸 Cheque Key Detected: [${chequeKey}] | Extracted URL: [${rawChequePhotoUrl}]`);
       console.log(`🔗 Formatted Delivery_Folder URL: ${finalDeliveryFolderUrl}`);
       console.log(`🔗 Formatted Cheque_Photo_Link URL: ${finalChequePhotoUrl}`);
 
-      // 5. Update Zoho Creator Package Record
+      // 5. Update Zoho Creator Package Record with Folder Link
       console.log(`📡 Updating Zoho Creator Package [${package_number}]...`);
       let creatorUpdated = false;
       let creatorError = null;
@@ -915,12 +925,12 @@ export const uploadPackageDeliveryPhotos = async (c) => {
           "Package_Number",
           package_number,
           {
-            Package_Delivery_Photos: mainDeliveryPhotoUrl
+            Package_Delivery_Photos: finalDeliveryFolderUrl
           },
           zohoToken
         );
         creatorUpdated = true;
-        console.log(`✅ Zoho Creator Package [${package_number}] updated.`);
+        console.log(`✅ Zoho Creator Package [${package_number}] updated with folder link.`);
       } catch (err) {
         console.error(`❌ Creator Package Delivery Photos Update Failed:`, err.message);
         creatorError = err.message;
@@ -941,7 +951,6 @@ export const uploadPackageDeliveryPhotos = async (c) => {
           dealRecordPayload.Delivery_Folder = finalDeliveryFolderUrl;
         }
 
-        // Attach Cheque_Photo_Link if a valid link exists
         if (finalChequePhotoUrl) {
           dealRecordPayload.Cheque_Photo_Link = finalChequePhotoUrl;
         }
@@ -1042,8 +1051,6 @@ export const uploadPackageDeliveryPhotos = async (c) => {
     }
   }
 };
-
-
 
 
 export const triggerDeliveryNotification = async (c) => {
