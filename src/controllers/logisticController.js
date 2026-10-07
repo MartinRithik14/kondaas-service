@@ -1,9 +1,9 @@
-import { withDatabase,Binary } from '../utils/config.js'; 
+import { withDatabase, Binary } from '../utils/config.js';
 import fs from 'fs';
 import path from 'path';
 import { getZohoAccessToken } from '../utils/zohoAuth.js';
 import { uploadToZohoWorkDrive, getOrCreateLeadsSEFolder } from '../utils/uploadToZohoWorkDrive.js';
-import {processWhatsAppNotification} from './notificationController.js';
+import { processWhatsAppNotification } from './notificationController.js';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
@@ -173,9 +173,9 @@ export const updateLogisticsStatus = async (c) => {
     // 2. Strict white-list status validation to protect data integrity
     const allowedStatuses = ["accepted", "inprogress", "completed"];
     if (!allowedStatuses.includes(status)) {
-      return c.json({ 
-        success: false, 
-        error: `Invalid status. Must be one of: ${allowedStatuses.join(", ")}` 
+      return c.json({
+        success: false,
+        error: `Invalid status. Must be one of: ${allowedStatuses.join(", ")}`
       }, 400);
     }
 
@@ -183,11 +183,11 @@ export const updateLogisticsStatus = async (c) => {
       // 3. Update the status and append a trailing audit timestamp
       const updateResult = await db.collection("logistics_deals").updateOne(
         { deal_id: deal_id },
-        { 
-          $set: { 
+        {
+          $set: {
             status: status,
             updatedAt: new Date()
-          } 
+          }
         }
       );
 
@@ -198,9 +198,9 @@ export const updateLogisticsStatus = async (c) => {
 
       console.log(`⚡ Logistics Deal ${deal_id} status updated to: ${status.toUpperCase()}`);
 
-      return c.json({ 
-        success: true, 
-        message: `Logistics pipeline successfully moved to ${status}.` 
+      return c.json({
+        success: true,
+        message: `Logistics pipeline successfully moved to ${status}.`
       }, 200);
     });
 
@@ -232,7 +232,7 @@ export const rejectLogisticsDeal = async (c) => {
       await db.collection("logistics_reject").insertOne(rejectPayload);
       console.log(`✅ Rejection tracked in logistics_reject for driver: ${mobile}`);
 
-     
+
 
       // 4. Look up active Administrator accounts to fetch their FCM tokens
       try {
@@ -306,8 +306,8 @@ export const createLogisticsProduct = async (c) => {
 
     // 1. Basic Payload Validation
     if (!body || Object.keys(body).length === 0) {
-      return c.json({ 
-        error: "Validation Error: Request body is empty. No data received." 
+      return c.json({
+        error: "Validation Error: Request body is empty. No data received."
       }, 400);
     }
 
@@ -319,11 +319,11 @@ export const createLogisticsProduct = async (c) => {
       const newLogisticsRecord = {
         ...body,
         createdAt: new Date(), // Record tracking timestamp
-        status: "picked" 
+        status: "picked"
       };
 
       console.log(`📦 Storing dynamic product details into kondaas-products...`);
-      
+
       const insertResult = await collection.insertOne(newLogisticsRecord);
 
       return c.json({
@@ -349,7 +349,7 @@ export const updateProductStatus = async (c) => {
       return c.json({ error: "Validation Error: Both 'id' and 'status' are required in the body." }, 400);
     }
 
-    const allowedStatuses = [ "dropped", "received", "inprogress", "installed"];
+    const allowedStatuses = ["dropped", "received", "inprogress", "installed"];
     if (!allowedStatuses.includes(status)) {
       return c.json({ error: `Validation Error: Invalid status. Must be one of: ${allowedStatuses.join(', ')}` }, 400);
     }
@@ -361,10 +361,10 @@ export const updateProductStatus = async (c) => {
 
       const updateResult = await collection.updateOne(
         { _id: new ObjectId(id) },
-        { 
-          $set: { 
+        {
+          $set: {
             status: status
-          } 
+          }
         }
       );
 
@@ -408,9 +408,9 @@ export const logLogisticsCompletion = async (c) => {
       console.log(`✅ Completion log created for Deal ID: ${deal_id} by driver: ${mobile}`);
 
       // 3. Send back a clean success response to the app
-      return c.json({ 
-        success: true, 
-        message: "Delivery completion successfully logged." 
+      return c.json({
+        success: true,
+        message: "Delivery completion successfully logged."
       }, 200);
     });
 
@@ -442,9 +442,9 @@ export const handleDispatchWebhook = async (c) => {
       // Upsert so re-triggers update existing dispatches instead of duplicating
       const result = await collection.updateOne(
         { dispatch_number: payload.dispatch_number },
-        { 
-          $set: dispatchDoc, 
-          $setOnInsert: { createdAt: new Date() } 
+        {
+          $set: dispatchDoc,
+          $setOnInsert: { createdAt: new Date() }
         },
         { upsert: true }
       );
@@ -583,7 +583,7 @@ export const updateDispatchOrPackageStatus = async (c) => {
       } else if (normalized === "picked" || normalized === "Picked") {
         zohoValue = "Picked";
         localCleanedStatus = "picked";
-      } else if (normalized === "delivered"|| normalized === "Delivered") {
+      } else if (normalized === "delivered" || normalized === "Delivered") {
         zohoValue = "Delivered";
         localCleanedStatus = "delivered";
       } else {
@@ -739,11 +739,11 @@ const formatZohoUrl = (val) => {
   if (!val || typeof val !== 'string') return null;
   const trimmed = val.trim();
   if (!trimmed) return null;
-  
+
   if (/^https?:\/\//i.test(trimmed)) {
     return trimmed;
   }
-  
+
   // If it's a raw WorkDrive folder/resource ID, construct a standard WorkDrive URL
   if (/^[a-zA-Z0-9_-]+$/.test(trimmed)) {
     return `https://workdrive.zoho.in/folder/${trimmed}`;
@@ -852,7 +852,7 @@ export const uploadPackageDeliveryPhotos = async (c) => {
       // 2. Resolve / Create the "Package" subfolder under the Deal ID in WorkDrive
       console.log(`📁 Resolving WorkDrive "Package" folder for Deal ID [${deal_id}] in [${state}]...`);
       const targetPackageFolder = await getOrCreateLeadsSEFolder(deal_id, "Package", state);
-      
+
       const targetFolderId = typeof targetPackageFolder === 'object' ? targetPackageFolder.id : targetPackageFolder;
 
       // Construct direct web navigation link for the WorkDrive folder
@@ -874,7 +874,7 @@ export const uploadPackageDeliveryPhotos = async (c) => {
       // 3. Write each file using ONLY the clean frontend key name, upload to WorkDrive, and collect URLs
       for (const item of incomingFiles) {
         const { fieldKey, file } = item;
-        
+
         const ext = path.extname(file.name || '') || (fieldKey.toLowerCase().includes('signature') ? '.png' : '.jpg');
         const fileName = `${fieldKey}${ext}`;
         const tempPath = path.join(process.cwd(), `${Date.now()}_${fileName}`);
@@ -902,7 +902,7 @@ export const uploadPackageDeliveryPhotos = async (c) => {
 
       // 4. Construct Navigation Links for CRM
       const mainDeliveryPhotoUrl = uploadedResultsMap['deliveryPhoto'] || uploadedFilesList[0]?.url || "";
-      
+
       // Target cheque photo or any key containing 'cheque'
       const chequeKey = Object.keys(uploadedResultsMap).find(k => k.toLowerCase().includes('cheque')) || 'chequePhoto';
       const rawChequePhotoUrl = uploadedResultsMap[chequeKey] || null;
@@ -916,21 +916,35 @@ export const uploadPackageDeliveryPhotos = async (c) => {
       console.log(`🔗 Formatted Cheque_Photo_Link URL: ${finalChequePhotoUrl}`);
 
       // 5. Update Zoho Creator Package Record with Folder Link
+      // 5. Update Zoho Creator Package Record with Folder Link
       console.log(`📡 Updating Zoho Creator Package [${package_number}]...`);
       let creatorUpdated = false;
       let creatorError = null;
+
+      // Extract pure URL without any HTML tags
+      const cleanFolderUrl = folderWebUrl || "";
+
       try {
-        await updateCreatorRecord(
+        // Test sending both URL object and fallback string, or inspect what field type it is:
+        const creatorPayload = {
+          // If Package_Delivery_Photos is a URL Field:
+          Package_Delivery_Photos: {
+            url: cleanFolderUrl,
+            title: "View Package Folder"
+          }
+          // Note: If Package_Delivery_Photos is a Single Line Text field instead, use:
+          // Package_Delivery_Photos: cleanFolderUrl
+        };
+
+        const creatorRes = await updateCreatorRecord(
           PACKAGES_REPORT_NAME,
           "Package_Number",
           package_number,
-          {
-            Package_Delivery_Photos: finalDeliveryFolderUrl
-          },
+          creatorPayload,
           zohoToken
         );
         creatorUpdated = true;
-        console.log(`✅ Zoho Creator Package [${package_number}] updated with folder link.`);
+        console.log(`✅ Zoho Creator Package [${package_number}] updated:`, JSON.stringify(creatorRes));
       } catch (err) {
         console.error(`❌ Creator Package Delivery Photos Update Failed:`, err.message);
         creatorError = err.message;
@@ -1001,7 +1015,7 @@ export const uploadPackageDeliveryPhotos = async (c) => {
 
       // 8. Update MongoDB "dispatches" collection
       const dispatchesColl = db.collection("dispatches");
-      const mongoFilter = dispatch_number 
+      const mongoFilter = dispatch_number
         ? { dispatch_number, "packages.package_number": package_number }
         : { "packages.package_number": package_number };
 
@@ -1055,13 +1069,13 @@ export const uploadPackageDeliveryPhotos = async (c) => {
 
 export const triggerDeliveryNotification = async (c) => {
   try {
-    const { 
-      customerMobile, 
-      customerName, 
-      scenarioType, 
-      eta, 
-      mapsUrl, 
-      driverNumber 
+    const {
+      customerMobile,
+      customerName,
+      scenarioType,
+      eta,
+      mapsUrl,
+      driverNumber
     } = await c.req.json();
 
     if (!customerMobile || scenarioType === undefined || scenarioType === null) {
@@ -1089,7 +1103,7 @@ export const triggerDeliveryNotification = async (c) => {
           messageText = `Dear ${resolvedCustomerName}, your solar power generating system package is packed and ready. Your delivery is scheduled for today.`;
           break;
         }
-        
+
         case 1: {
           // Despatched
           let extraDetails = [];
@@ -1159,7 +1173,7 @@ export const triggerDeliveryNotification = async (c) => {
         },
         4: {
           // If you have a separate text template for Scenario 4
-          templateName: "delivery_completed", 
+          templateName: "delivery_completed",
           bodyValues: [String(resolvedCustomerName).trim()]
         }
       };
@@ -1180,7 +1194,7 @@ export const triggerDeliveryNotification = async (c) => {
       });
 
       // Dispatch via existing worker
-      processWhatsAppNotification(textResult.insertedId).catch(err => 
+      processWhatsAppNotification(textResult.insertedId).catch(err =>
         console.error("❌ Failed to process delivery text notification:", err.message)
       );
 
@@ -1201,7 +1215,7 @@ export const triggerDeliveryNotification = async (c) => {
 
         pollNotificationId = pollResult.insertedId;
 
-        processWhatsAppNotification(pollResult.insertedId).catch(err => 
+        processWhatsAppNotification(pollResult.insertedId).catch(err =>
           console.error("❌ Failed to process delivery poll notification:", err.message)
         );
       }

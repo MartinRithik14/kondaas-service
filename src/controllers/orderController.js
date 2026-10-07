@@ -389,11 +389,11 @@ export const updateSurveyStatus = async (c) => {
     }
 
     // Fallback if the requested value doesn't match your system options
-    if (!zohoValue) {
+    if (!zohoValue) { 
       return c.json({
         error: `Validation Error: '${status}' is not recognized. Must be one of: scheduled, rejected, completed, accepted, inprogress`
       }, 400);
-    }
+    } 
 
     return await withDatabase(MONGODB_URI, async (db) => {
       // 🔐 Grab active authorization credentials dynamically out of your RAM/Atlas cache
