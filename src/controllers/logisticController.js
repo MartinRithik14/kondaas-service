@@ -423,31 +423,78 @@ export const logLogisticsCompletion = async (c) => {
 
 export const handleDispatchWebhook = async (c) => {
   try {
-    const payload = await c.req.json();
+    let payload = {};
+    const contentType = c.req.header("content-type") || "";
 
-    // Basic validation
+    // 1. Dual Parser: Support both URL-encoded form-data and pure JSON
+    if (contentType.includes("application/json")) {
+      try {
+        payload = await c.req.json();
+      } catch (err) {
+        console.warn("⚠️ JSON parse failed, falling back to body parser...");
+      }
+    }
+
+    if (!payload || Object.keys(payload).length === 0) {
+      const parsedBody = await c.req.parseBody();
+      payload = { ...parsedBody };
+    }
+
+    // 2. Safe JSON parser helper to auto-repair Deluge unquoted date literals (e.g., :2026-09-24)
+    const safeParseDelugeJson = (raw) => {
+      if (typeof raw !== "string") return raw;
+      try {
+        // Fix unquoted dates like :2026-09-24 or :24-Sep-2026 -> :"2026-09-24"
+        const sanitized = raw.replace(/:\s*([0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}-[A-Za-z]{3}-[0-9]{4})/g, ':"$1"');
+        return JSON.parse(sanitized);
+      } catch (err) {
+        console.warn("⚠️ Deluge JSON sanitize & parse failed:", err.message);
+        try {
+          return JSON.parse(raw);
+        } catch {
+          return raw;
+        }
+      }
+    };
+
+    // 3. Decode nested arrays (packages and product_details)
+    if (payload.packages) {
+      payload.packages = safeParseDelugeJson(payload.packages);
+    }
+    if (payload.product_details) {
+      payload.product_details = safeParseDelugeJson(payload.product_details);
+    }
+
+    console.log("📥 Final Parsed Webhook Payload:", JSON.stringify(payload, null, 2));
+
+    // 4. Basic Validation
     if (!payload.dispatch_number) {
       return c.json({ error: "dispatch_number is required!" }, 400);
     }
 
+    // 5. Protect MongoDB immutability by stripping _id
+    const { _id, ...cleanPayload } = payload;
+
+    // 6. Match exact previous document schema
     const dispatchDoc = {
-      ...payload,
-      assigned_to: payload.driver_mobile || payload.assigned_to || null,
+      ...cleanPayload,
+      assigned_to: cleanPayload.driver_mobile || cleanPayload.assigned_to || null,
+      status: cleanPayload.status || (cleanPayload.dispatch_status ? cleanPayload.dispatch_status.toLowerCase() : "ready to ship"),
       updatedAt: new Date(),
     };
 
     return await withDatabase(MONGODB_URI, async (db) => {
       const collection = db.collection("dispatches");
 
-      // Upsert so re-triggers update existing dispatches instead of duplicating
       const result = await collection.updateOne(
-        { dispatch_number: payload.dispatch_number },
+        { dispatch_number: String(cleanPayload.dispatch_number) },
         {
-          $set: dispatchDoc,
-          $setOnInsert: { createdAt: new Date() }
+          $set: dispatchDoc,$setOnInsert: { createdAt: new Date() }
         },
         { upsert: true }
       );
+
+      console.log(`✅ Webhook processed successfully for dispatch: ${cleanPayload.dispatch_number}`);
 
       return c.json({
         success: true,
@@ -458,6 +505,7 @@ export const handleDispatchWebhook = async (c) => {
     });
 
   } catch (err) {
+    console.error("❌ Fatal Webhook Error:", err.stack || err.message);
     return c.json({ error: err.message }, 500);
   }
 };
