@@ -213,89 +213,126 @@ export const updateLogisticsStatus = async (c) => {
 export const rejectLogisticsDeal = async (c) => {
   try {
     const body = await c.req.json();
-    // 1. Destructure only the relevant logistics parameters
-    const { deal_id, mobile, comment } = body;
+    const { 
+      dispatch_number, 
+      driver_mobile, 
+      driver_name, 
+      vehicle_number, 
+      comment, 
+      receivedAt 
+    } = body;
 
-    if (!deal_id || !comment) {
-      return c.json({ success: false, error: "deal_id and rejection reason (comment) are required" }, 400);
+    if (!dispatch_number) {
+      return c.json({ error: "dispatch_number is required" }, 400);
+    }
+
+    if (!comment) {
+      return c.json({ error: "Rejection reason (comment) is required" }, 400);
     }
 
     return await withDatabase(MONGODB_URI, async (db) => {
-      // 2. Insert lightweight audit document into 'logistics_rejects'
+      // 1. Fetch current dispatch record to capture snapshots
+      const existingDispatch = await db.collection("dispatches").findOne({ 
+        dispatch_number: String(dispatch_number) 
+      });
+
+      if (!existingDispatch) {
+        return c.json({ error: "Dispatch record not found" }, 404);
+      }
+
+      // 2. Audit record in dispatch_reject
+      const rejectedTimestamp = receivedAt 
+        ? new Date(Number(receivedAt)).toISOString() 
+        : new Date().toISOString();
+
       const rejectPayload = {
-        deal_id: String(deal_id),
-        mobile: mobile || "N/A",
+        dispatch_number: existingDispatch.dispatch_number,
+        driver_name: driver_name || existingDispatch.driver_name || null,
+        driver_mobile: driver_mobile || existingDispatch.driver_mobile || existingDispatch.assigned_to || null,
+        vehicle_number: vehicle_number || existingDispatch.vehicle_number || null,
         comment: comment,
-        rejectedAt: new Date()
+        assigned_to: existingDispatch.assigned_to || null,
+        rejectedAt: rejectedTimestamp,
+        createdAt: new Date()
       };
 
-      await db.collection("logistics_reject").insertOne(rejectPayload);
-      console.log(`✅ Rejection tracked in logistics_reject for driver: ${mobile}`);
+      const rejectResult = await db.collection("dispatch_reject").insertOne(rejectPayload);
+      const rejectionMongoId = rejectResult.insertedId;
 
+      // 3. Reset main dispatch record: push rejection reference, update status, and clear driver fields
+      const updateResult = await db.collection("dispatches").updateOne(
+        { dispatch_number: String(dispatch_number) },
+        {
+          $push: { rejections: rejectionMongoId },$set: {
+            dispatch_status: "Rejected",
+            status: "rejected",
+            remarks: `Rejected by driver: ${comment}`,
+            updatedAt: new Date().toISOString()
+          },
+          $unset: {
+            assigned_to: "",
+            driver_mobile: "",
+            driver_name: "",
+            vehicle_number: ""
+          }
+        }
+      );
 
-
-      // 4. Look up active Administrator accounts to fetch their FCM tokens
+      // 4. Send push notification to Admins / Logistics Managers
       try {
-        const admins = await db.collection("userdetails").find({
-          "UserInfo.role": "admin"
+        const admins = await db.collection("userDetails").find({
+          "UserInfo.role": { $in: ["admin", "logistics_manager"] }
         }).toArray();
 
         let adminTokens = [];
-
-        admins.forEach((adminUser) => {
-          const devices = adminUser.PlatformInfo?.devices;
-          if (devices && Array.isArray(devices)) {
+        admins.forEach((user) => {
+          const devices = user.PlatformInfo?.devices;
+          if (Array.isArray(devices)) {
             devices.forEach((device) => {
-              if (device.fcmToken) {
-                adminTokens.push(device.fcmToken);
-              }
+              if (device.fcmToken) adminTokens.push(device.fcmToken);
             });
           }
         });
 
-        // 5. Send standard push notification to Admins
         if (adminTokens.length > 0) {
+          const dName = driver_name || existingDispatch.driver_name || "Driver";
           const message = {
             notification: {
-              title: "🚨 Delivery Assignment Rejected!",
-              body: `Logistics member (${mobile || 'Driver'}) rejected Deal ID: ${deal_id}. Reason: ${comment}`,
+              title: "Dispatch Rejected! ⚠️",
+              body: `${dName} rejected ${dispatch_number}. Reason: ${comment}`,
             },
             android: {
               priority: "high",
-              notification: {
-                channelId: "weekly_summary_channel_v1",
-                sound: "default",
-              }
+              notification: { sound: "default" }
             },
             apns: {
-              payload: {
-                aps: {
-                  sound: "default"
-                }
-              }
+              payload: { aps: { sound: "default" } }
             },
             data: {
               click_action: "FLUTTER_NOTIFICATION_CLICK",
-              type: "LOGISTICS_REJECTION",
-              deal_id: String(deal_id)
+              type: "DISPATCH_REJECTION",
+              dispatch_number: String(dispatch_number)
             },
             tokens: adminTokens,
           };
 
-          const response = await admin.messaging().sendEachForMulticast(message);
-          console.log(`🚀 Rejection alert pushed to Admin devices. Success count: ${response.successCount}`);
-        } else {
-          console.log(`⚠️ Rejection recorded, but no active Admin FCM tokens found.`);
+          await admin.messaging().sendEachForMulticast(message);
         }
       } catch (pushErr) {
-        console.error("⚠️ Non-blocking warning: Failed to send Admin notification:", pushErr.message);
+        console.error("⚠️ Non-blocking: Failed to push notification:", pushErr.message);
       }
 
-      return c.json({ success: true, message: "Logistics deal rejection tracked and Admin notified." }, 200);
+      return c.json({
+        success: true,
+        message: "Dispatch rejection recorded, assignment cleared, and Admin notified.",
+        rejectionId: rejectionMongoId,
+        matchedCount: updateResult.matchedCount,
+        modifiedCount: updateResult.modifiedCount
+      });
     });
   } catch (err) {
-    console.error("❌ rejectLogisticsDeal Exception Error:", err.message);
-    return c.json({ success: false, error: "Internal server error" }, 500);
+    console.error("❌ rejectLogisticsDeal Exception:", err.message);
+    return c.json({ error: "Internal server error" }, 500);
   }
 };
 
@@ -472,15 +509,15 @@ export const handleDispatchWebhook = async (c) => {
       return c.json({ error: "dispatch_number is required!" }, 400);
     }
 
-    // 5. Protect MongoDB immutability by stripping _id
-    const { _id, ...cleanPayload } = payload;
+    // 5. Strip _id and exclude rejections so existing rejection history is never overwritten
+    const { _id, rejections, ...cleanPayload } = payload;
 
     // 6. Match exact previous document schema
     const dispatchDoc = {
       ...cleanPayload,
       assigned_to: cleanPayload.driver_mobile || cleanPayload.assigned_to || null,
       status: cleanPayload.status || (cleanPayload.dispatch_status ? cleanPayload.dispatch_status.toLowerCase() : "ready to ship"),
-      updatedAt: new Date(),
+      updatedAt: new Date().toISOString(),
     };
 
     return await withDatabase(MONGODB_URI, async (db) => {
@@ -489,7 +526,10 @@ export const handleDispatchWebhook = async (c) => {
       const result = await collection.updateOne(
         { dispatch_number: String(cleanPayload.dispatch_number) },
         {
-          $set: dispatchDoc,$setOnInsert: { createdAt: new Date() }
+          $set: dispatchDoc,$setOnInsert: { 
+            createdAt: new Date().toISOString(),
+            rejections: [] // Initializes an empty rejection array only when inserting a brand-new dispatch
+          }
         },
         { upsert: true }
       );
