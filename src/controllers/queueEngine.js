@@ -151,6 +151,10 @@ export const startQueueRunner = () => {
             await handleZohoDealsSafetySync(db, job);
             break;  
 
+          case "ZOHO_CREATOR_DISPATCH_SYNC":
+            await handleZohoCreatorDispatchSafetySync(db, job);
+            break;
+
           default:
             console.log(`⚠️ Unknown or retired task type encountered: ${job.taskType}`);
             await db.collection("jobs_queue").updateOne(
@@ -453,6 +457,8 @@ function formatToWebhookDateString(isoString) {
   return `${MM}-${DD}-${YYYY} ${hh}:${mm}:${ss}`;
 }
 
+//Deals Sync function!!!
+
 export async function handleZohoDealsSafetySync(db, task) {
   // 🎯 THE FIX: capture the run's START time right here, before any fetch
   // or upsert happens. This — not the completion time — is what gets
@@ -752,4 +758,327 @@ async function rescheduleTask(db, taskId, runStartTime) {
     }
   );
   console.log(`⏰ Next safety sync scheduled at: ${nextRun.toISOString()} (this run's lastRunAt locked at: ${runStartTime.toISOString()})`);
+}
+
+//Dispatch Sync function!!!
+
+  // ==========================================
+// Zoho Creator Configuration & Helper Functions
+// ==========================================
+
+const CREATOR_ACCOUNT_OWNER = "kondaasautomation";
+const CREATOR_APP_NAME = "packing-management";
+const PACKAGES_REPORT_NAME = "Packages";
+const DISPATCHES_REPORT_NAME = "Dispatches";
+
+// Formats JS Date to Zoho Creator criteria format: "dd-MMM-yyyy HH:mm:ss"
+function formatCreatorDateTime(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${pad(date.getDate())}-${months[date.getMonth()]}-${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+// Fetches every Dispatches record modified since `sinceDate`, following cursor pagination
+async function fetchModifiedDispatches(zohoToken, sinceDate) {
+  const criteria = `Modified_Time > '${formatCreatorDateTime(sinceDate)}'`;
+  const baseUrl = `https://creator.zoho.in/api/v2/${CREATOR_ACCOUNT_OWNER}/${CREATOR_APP_NAME}/report/${DISPATCHES_REPORT_NAME}?criteria=(${encodeURIComponent(criteria)})`;
+
+  const allRecords = [];
+  let cursor = null;
+
+  do {
+    const headers = { Authorization: `Zoho-oauthtoken ${zohoToken}` };
+    if (cursor) headers["record_cursor"] = cursor;
+
+    const res = await fetch(baseUrl, { headers });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Zoho Creator Dispatches fetch failed (${res.status}): ${errText}`);
+    }
+
+    const body = await res.json();
+    allRecords.push(...(body?.data || []));
+    cursor = res.headers.get("record_cursor") || null;
+  } while (cursor);
+
+  return allRecords;
+}
+
+// 2. Fetch Full Package Documents matching IDs from Creator
+async function fetchFullPackagesByIds(zohoToken, packageIds) {
+  if (!packageIds || packageIds.length === 0) return new Map();
+
+  const packageMap = new Map();
+  // Batch requests in chunks of 50 to avoid hitting URL criteria length limits
+  const chunkSize = 50;
+  for (let i = 0; i < packageIds.length; i += chunkSize) {
+    const chunk = packageIds.slice(i, i + chunkSize);
+    const criteria = chunk.map((id) => `ID == ${id}`).join(" || ");
+    const url = `https://creator.zoho.in/api/v2/${CREATOR_ACCOUNT_OWNER}/${CREATOR_APP_NAME}/report/${PACKAGES_REPORT_NAME}?criteria=(${encodeURIComponent(criteria)})`;
+
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: `Zoho-oauthtoken ${zohoToken}` }
+      });
+
+      if (res.ok) {
+        const body = await res.json();
+        const records = body?.data || [];
+        for (const pkg of records) {
+          packageMap.set(String(pkg.ID), pkg);
+          if (pkg.Package_Number) {
+            packageMap.set(String(pkg.Package_Number), pkg);
+          }
+        }
+      } else {
+        console.warn(`⚠️ Failed to fetch packages chunk (${res.status}):`, await res.text());
+      }
+    } catch (e) {
+      console.warn("⚠️ Exception during packages fetch chunk:", e.message);
+    }
+  }
+
+  return packageMap;
+}
+
+// 3. Normalizes Creator Subform Product Details to match Mongo document schema
+function mapProductDetails(rawList) {
+  if (!Array.isArray(rawList)) return [];
+  return rawList.map((item) => ({
+    product_id: item.Product_ID || null,
+    product_name: item.Product_Name1 || item.Product_Name || null,
+    quantity: item.Quantity != null ? Number(item.Quantity) : 0,
+    type_field: item.Type_field || "Normal",
+    kit_name: item.Kit_Name || null,
+    kit_id: item.Kit_ID || null,
+    serial_number: item.Serial_Number || null,
+    package: item.Package != null ? Number(item.Package) : null
+  }));
+}
+
+// 4. Normalizes Creator Package Items Subform
+function mapPackageItems(rawItems) {
+  if (!Array.isArray(rawItems)) return [];
+  return rawItems.map((item) => ({
+    product_id: item.Product_ID || null,
+    product_name: item.Product_Name || null,
+    quantity: item.Quantity != null ? Number(item.Quantity) : 0,
+    type_field: item.Type_field || "Normal",
+    kit_name: item.Kit_Name || "",
+    kit_id: item.Kit_ID || null,
+    serial_number: item.Serial_Number || null
+  }));
+}
+
+// 5. Complete Package Formatter matching your webhook output
+function formatPackage(pkg) {
+  return {
+    package_number: pkg.Package_Number || null,
+    status: pkg.Status || "Packed",
+    packaging_date: pkg.Packaging_Date || null,
+    planned_date: pkg.Planned_Date || null,
+    preferred_date: pkg.Preferred_Date || null,
+    so_number: pkg.SO_Number != null ? Number(pkg.SO_Number) : null,
+    package_books_id: pkg.Package_Books_ID || "",
+    delivery_challan_number: pkg.Delivery_Challan_Number || "",
+    shipment_number: pkg.Shipment_Number || "",
+    crm_deal_id: pkg.CRM_Deal_ID || null,
+    deal_name: pkg.Deal_Name != null ? String(pkg.Deal_Name) : null,
+    account: pkg.Account != null ? Number(pkg.Account) : null,
+    contact: pkg.Contact != null ? Number(pkg.Contact) : null,
+    mobile: pkg.Mobile != null ? String(pkg.Mobile) : null,
+    billing_street: pkg.Billing_Street || null,
+    billing_city: pkg.Billing_City || null,
+    billing_state: pkg.Billing_State || null,
+    billing_code: pkg.Billing_Code || null,
+    billing_country: pkg.Billing_Country || null,
+    shipping_street: pkg.Shipping_Street || null,
+    shipping_city: pkg.Shipping_City || null,
+    shipping_state: pkg.Shipping_State || null,
+    shipping_code: pkg.Shipping_Code || null,
+    shipping_country: pkg.Shipping_Country || null,
+    package_items: mapPackageItems(pkg.Package_Items)
+  };
+}
+
+// ==========================================
+// Main Safety Sync Function
+// ==========================================
+export async function handleZohoCreatorDispatchSafetySync(db, task) {
+  const runStartTime = new Date();
+
+  try {
+    const lastRunAt = task.lastRunAt ? new Date(task.lastRunAt) : null;
+    let windowStart;
+
+    if (lastRunAt) {
+      const elapsedMinutes = (runStartTime.getTime() - lastRunAt.getTime()) / 60000;
+      if (elapsedMinutes > NORMAL_INTERVAL_MINUTES) {
+        console.warn(`⚠️ Creator Dispatch sync gap: last run was ${elapsedMinutes.toFixed(1)}m ago (expected ~${NORMAL_INTERVAL_MINUTES}m). Catching up.`);
+      } else {
+        console.log(`🔄 Running scheduled Creator dispatch safety sync (${elapsedMinutes.toFixed(1)}m since last run)...`);
+      }
+      windowStart = new Date(lastRunAt.getTime() - SAFETY_BUFFER_MINUTES * 60 * 1000);
+    } else {
+      console.log("🚀 [First Run Detected] Fetching all Creator dispatch records...");
+      windowStart = new Date(0);
+    }
+
+    const zohoToken = await getZohoAccessToken(db);
+    const dispatches = await fetchModifiedDispatches(zohoToken, windowStart);
+
+    console.log(`📦 Fetched ${dispatches.length} modified Dispatch record(s) from Zoho Creator.`);
+
+    // Collect all Package IDs across all dispatches to batch fetch package details
+    const allPackageIds = [];
+    dispatches.forEach((d) => {
+      if (Array.isArray(d.Packages)) {
+        d.Packages.forEach((p) => {
+          const val = typeof p === "object" ? p.ID || p.display_value : p;
+          if (val) allPackageIds.push(String(val));
+        });
+      }
+    });
+
+    const packageMap = await fetchFullPackagesByIds(zohoToken, allPackageIds);
+
+    const dispatchesColl = db.collection("dispatches");
+    let dispatchesUpserted = 0;
+
+    for (const record of dispatches) {
+      const dispatchNumber = record.Dispatch_Number;
+      if (!dispatchNumber) {
+        console.warn("⚠️ Skipping record without Dispatch_Number:", record.ID);
+        continue;
+      }
+
+      const driverMobile = record.Driver_Mobile ? String(record.Driver_Mobile).trim() : null;
+      const driverName = record.Driver_Name || null;
+      const vehicleNumber = record.Vehicle_Number || null;
+      const deliveryMethod = record.Delivery_Method || "Free Delivery";
+      const dispatchDate = record.Dispatch_Date || null;
+      const remarks = record.Remarks || "";
+      const qrCode = record.QR_Code || null;
+      const dispatchStatus = record.Dispatch_Status || null;
+      const status = dispatchStatus ? dispatchStatus.toLowerCase().trim() : "ready to ship";
+
+      const productDetails = mapProductDetails(record.Product_Details);
+
+      // Map package array with full attributes
+      const rawPkgList = Array.isArray(record.Packages) ? record.Packages : [];
+      const mappedPackages = rawPkgList.map((p) => {
+        const pkgKey = typeof p === "object" ? String(p.ID || p.display_value) : String(p);
+        const fullPkg = packageMap.get(pkgKey);
+        if (fullPkg) {
+          return formatPackage(fullPkg);
+        }
+        // Minimal fallback shell if package was deleted or not returned by report
+        return {
+          package_number: typeof p === "object" ? p.display_value : String(p),
+          status: "Packed",
+          package_items: []
+        };
+      });
+
+      const existingDoc = await dispatchesColl.findOne({ dispatch_number: dispatchNumber });
+
+      if (!existingDoc) {
+        // Complete insert matching the webhook payload schema
+        await dispatchesColl.insertOne({
+          dispatch_number: dispatchNumber,
+          assigned_to: driverMobile,
+          driver_mobile: driverMobile,
+          driver_name: driverName,
+          vehicle_number: vehicleNumber,
+          delivery_method: deliveryMethod,
+          dispatch_date: dispatchDate,
+          dispatch_status: dispatchStatus,
+          status: status,
+          packages: mappedPackages,
+          product_details: productDetails,
+          remarks: remarks,
+          qr_code: qrCode,
+          rejections: [],
+          createdAt: new Date(),
+          updatedAt: new Date()
+        });
+
+        dispatchesUpserted++;
+        continue;
+      }
+
+      // Existing document: update dispatch metadata, product details, and merge packages
+      const existingPkgNumbers = new Set((existingDoc.packages || []).map((p) => p.package_number));
+      const newPackagesToAppend = mappedPackages.filter((p) => p.package_number && !existingPkgNumbers.has(p.package_number));
+
+      const updateOps = {
+        $set: {
+          delivery_method: deliveryMethod,
+          dispatch_date: dispatchDate,
+          dispatch_status: dispatchStatus,
+          status: existingDoc.status === "rejected" ? "rejected" : status,
+          product_details: productDetails,
+          remarks: remarks,
+          qr_code: qrCode,
+          updatedAt: new Date()
+        }
+      };
+
+      // Only re-set driver fields if the existing record isn't currently sitting in a rejected state
+      if (existingDoc.status !== "rejected" && driverMobile) {
+        updateOps.$set.assigned_to = driverMobile;
+        updateOps.$set.driver_mobile = driverMobile;
+        updateOps.$set.driver_name = driverName;
+        updateOps.$set.vehicle_number = vehicleNumber;
+      }
+
+      if (newPackagesToAppend.length > 0) {
+        updateOps.$push = {
+          packages: { $each: newPackagesToAppend }
+        };
+      }
+
+      await dispatchesColl.updateOne({ dispatch_number: dispatchNumber }, updateOps);
+      dispatchesUpserted++;
+    }
+
+    console.log(`✅ Creator dispatch sync complete. Dispatches processed/updated: ${dispatchesUpserted}`);
+
+    // Schedule next run
+    await rescheduleDispatchTask(db, task._id, runStartTime);
+
+  } catch (err) {
+    console.error("❌ Error in handleZohoCreatorDispatchSafetySync:", err.message);
+
+    // 5-minute backoff retry
+    await db.collection("jobs_queue").updateOne(
+      { _id: task._id },
+      {
+        $set: {
+          status: "pending",
+          lockedAt: null,
+          runAt: new Date(Date.now() + 5 * 60 * 1000)
+        }
+      }
+    );
+  }
+}
+
+async function rescheduleDispatchTask(db, taskId, runStartTime) {
+  const NORMAL_INTERVAL_MINUTES = 60; // ⚡ Added here so it's always accessible
+  const nextRun = new Date(Date.now() + NORMAL_INTERVAL_MINUTES * 60 * 1000);
+  
+  await db.collection("jobs_queue").updateOne(
+    { _id: taskId },
+    {
+      $set: {
+        status: "pending",
+        lockedAt: null,
+        lastRunAt: runStartTime,
+        runAt: nextRun
+      }
+    }
+  );
+  console.log(`⏰ Next Creator dispatch sync scheduled at: ${nextRun.toISOString()} (lastRunAt locked at: ${runStartTime.toISOString()})`);
 }
