@@ -301,12 +301,37 @@ export const saveWhatsAppRating = async (c) => {
   }
 };
 
+const toPreviewUrl = (url, fileId) => {
+  if (!url && fileId) return `https://workdrive.zoho.in/file/${fileId}`;
+  if (typeof url === "string" && url.includes("/api/v1/download/")) {
+    const extractedId = url.split("/download/")[1];
+    return `https://workdrive.zoho.in/file/${extractedId}`;
+  }
+  return url || "";
+};
+
+const formatZohoUrl = (url) => {
+  if (!url) return "";
+  return String(url).trim();
+};
+
+// ==========================================
+// Controller Function
+// ==========================================
+
 export const triggerScenarioNotification = async (c) => {
   try {
     const { deal_id, surveyorNumber, customerMobile, name, scenarioType, eta, state } = await c.req.json();
 
-    let cleanedCustomerMobile = customerMobile ? String(customerMobile).replace(/\D/g, '') : null;
-    if (cleanedCustomerMobile && cleanedCustomerMobile.length === 12 && cleanedCustomerMobile.startsWith('91')) {
+    const numericScenario = Number(scenarioType);
+
+    // Guard against Scenario 2 or unknown scenarios
+    if (![1, 3, 4].includes(numericScenario)) {
+      return c.json({ error: `Invalid scenarioType: ${scenarioType}. Supported scenarios are 1, 3, and 4.` }, 400);
+    }
+
+    let cleanedCustomerMobile = customerMobile ? String(customerMobile).replace(/\D/g, "") : null;
+    if (cleanedCustomerMobile && cleanedCustomerMobile.length === 12 && cleanedCustomerMobile.startsWith("91")) {
       cleanedCustomerMobile = cleanedCustomerMobile.substring(2);
     }
 
@@ -314,53 +339,47 @@ export const triggerScenarioNotification = async (c) => {
       const customerName = name || "Customer";
       const whatsappTo = cleanedCustomerMobile;
 
-      // 1. Text message templates for Evolution API (Map URL removed from 1 to align with Interakt)
+      // 1. Text message templates for Evolution API (1 and 3 only; 4 is handled via final poll)
       const messages = {
-        1: `Hello ${customerName}, your Kondaas technician has started. Arrival in ${eta || 'soon'} min. Contact: ${surveyorNumber}.`,
-        2: `Hello ${customerName}, your technician is just 300 meters away!`,
-        3: `Hello ${customerName}, your technician has arrived.`,
-        4: `Hello ${customerName}, your technician has completed the work. Thank you for choosing Kondaas! and kindly give rating.`
+        1: `Hello ${customerName}, your Kondaas technician has started. Arrival in ${eta || "soon"} min. Contact: ${surveyorNumber}.`,
+        3: `Hello ${customerName}, your technician has arrived.`
       };
 
-      // 2. Interakt fallback metadata mappings
+      // 2. Interakt fallback metadata mappings (1 and 3 only)
       const interaktTemplates = {
         1: {
           templateName: "surveyor_started",
           bodyValues: [String(customerName), String(eta || "30"), String(surveyorNumber || "")]
         },
-        2: {
-          templateName: "surveyor_nearby",
-          bodyValues: [String(customerName)]
-        },
         3: {
           templateName: "surveyor_arrived",
-          bodyValues: [String(customerName)]
-        },
-        4: {
-          templateName: "surveyor_completed_rating_d4",
           bodyValues: [String(customerName)]
         }
       };
 
-      const fallbackMeta = interaktTemplates[scenarioType] || {};
+      let textNotificationId = null;
 
-      // --- STEP 1: ALWAYS SEND THE TEXT MESSAGE FIRST ---
-      const textResult = await db.collection("notifications").insertOne({
-        from: "Kondaas_System",
-        to: whatsappTo,
-        mode: "whatsapp",
-        content: new Binary(Buffer.from(messages[scenarioType], 'utf8')),
-        contentType: "text",
-        templateName: fallbackMeta.templateName,
-        bodyValues: fallbackMeta.bodyValues,
-        status: "pending",
-        createdAt: new Date()
-      });
-      processWhatsAppNotification(textResult.insertedId).catch(err => console.error(err));
+      // --- STEP 1: SEND IMMEDIATE TEXT NOTIFICATION ONLY FOR SCENARIOS 1 AND 3 ---
+      if (numericScenario === 1 || numericScenario === 3) {
+        const fallbackMeta = interaktTemplates[numericScenario] || {};
+        const textResult = await db.collection("notifications").insertOne({
+          from: "Kondaas_System",
+          to: whatsappTo,
+          mode: "whatsapp",
+          content: new Binary(Buffer.from(messages[numericScenario] || "", "utf8")),
+          contentType: "text",
+          templateName: fallbackMeta.templateName,
+          bodyValues: fallbackMeta.bodyValues,
+          status: "pending",
+          createdAt: new Date()
+        });
 
-      // --- STEP 2: SCENARIO 4 HEAVY BACKGROUND TREE & POLL EXECUTION ---
-      if (Number(scenarioType) === 4) {
+        textNotificationId = textResult.insertedId;
+        processWhatsAppNotification(textNotificationId).catch((err) => console.error(err));
+      }
 
+      // --- STEP 2: SCENARIO 4 HEAVY BACKGROUND TREE & SOLE POLL EXECUTION ---
+      if (numericScenario === 4) {
         (async () => {
           try {
             if (!deal_id) {
@@ -387,7 +406,7 @@ export const triggerScenarioNotification = async (c) => {
             const surveyHtml = getSurveyReportTemplate(formData);
             await generatePDF(surveyHtml, surveyFilePath);
 
-            console.log(`🔄 Resolving Zoho WorkDrive "Survey" Folder for Deal ID [${deal_id}] in [${state || 'Default'}]...`);
+            console.log(`🔄 Resolving Zoho WorkDrive "Survey" Folder for Deal ID [${deal_id}] in [${state || "Default"}]...`);
             const targetSurveyFolderId = await getOrCreateLeadsSEFolder(deal_id, "Survey", state);
 
             const surveyUploadResult = await uploadToZohoWorkDrive(surveyFilePath, surveyFileName, targetSurveyFolderId);
@@ -401,15 +420,19 @@ export const triggerScenarioNotification = async (c) => {
               console.log(`📡 Attaching survey report link to Zoho CRM Deals for ID: ${deal_id}`);
               const zohoToken = await getZohoAccessToken(db);
 
+              const surveyPreviewUrl = surveyUploadResult?.fileId
+                ? `https://workdrive.zoho.in/file/${surveyUploadResult.fileId}`
+                : toPreviewUrl(surveyUploadResult?.url, surveyUploadResult?.fileId);
+
               const linkPayload = {
                 id: deal_id,
-                Site_Survey_form: String(surveyUploadResult.url).trim()
+                Site_Survey_form: formatZohoUrl(surveyPreviewUrl)
               };
 
               const crmResponse = await fetch(`https://www.zohoapis.in/crm/v8/Deals/${deal_id}`, {
                 method: "PUT",
                 headers: {
-                  "Authorization": `Zoho-oauthtoken ${zohoToken}`,
+                  Authorization: `Zoho-oauthtoken ${zohoToken}`,
                   "Content-Type": "application/json"
                 },
                 body: JSON.stringify({ data: [linkPayload] })
@@ -432,7 +455,7 @@ export const triggerScenarioNotification = async (c) => {
             const invoiceHtml = getInvoiceTemplate(formData);
             await generatePDF(invoiceHtml, invoiceFilePath);
 
-            console.log(`🔄 Resolving Zoho WorkDrive "Invoice" Folder for Deal ID [${deal_id}] in [${state || 'Default'}]...`);
+            console.log(`🔄 Resolving Zoho WorkDrive "Invoice" Folder for Deal ID [${deal_id}] in [${state || "Default"}]...`);
             const targetInvoiceFolderId = await getOrCreateLeadsSEFolder(deal_id, "Invoice", state);
 
             const invoiceUploadResult = await uploadToZohoWorkDrive(invoiceFilePath, invoiceFileName, targetInvoiceFolderId);
@@ -448,20 +471,21 @@ export const triggerScenarioNotification = async (c) => {
               if (err) console.error("❌ Error deleting local temporary invoice PDF:", err.message);
             });
 
-            // 📊 🎯 Interactive satisfaction rating poll with Interakt fallback metadata
+            // 📊 🎯 Single rating poll delivered once background PDF work completes
             console.log("📊 Sending customer satisfaction rating poll feedback interface...");
             const pollResult = await db.collection("notifications").insertOne({
               from: "Kondaas_System",
               to: whatsappTo,
               mode: "whatsapp",
-              content: new Binary(Buffer.from("Rate our service", 'utf8')),
+              content: new Binary(Buffer.from("Rate our service", "utf8")),
               contentType: "poll",
-              templateName: "surveyor_feedback_rating",
+              templateName: "surveyor_completed_rating_d4",
               bodyValues: [String(customerName)],
               status: "pending",
               createdAt: new Date()
             });
-            processWhatsAppNotification(pollResult.insertedId).catch(err => console.error(err));
+
+            processWhatsAppNotification(pollResult.insertedId).catch((err) => console.error(err));
 
           } catch (pdfErr) {
             console.error("❌ Background PDF Document Tree Generation Failed:", pdfErr);
@@ -470,8 +494,8 @@ export const triggerScenarioNotification = async (c) => {
       }
 
       return c.json({
-        message: `Scenario ${scenarioType} flow executed.`,
-        id: textResult.insertedId
+        message: `Scenario ${numericScenario} flow executed.`,
+        id: textNotificationId
       });
     });
   } catch (err) {
