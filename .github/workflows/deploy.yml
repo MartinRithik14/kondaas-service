@@ -1,0 +1,46 @@
+name: Deploy Kondaas Service to Vultr
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (e.g., 2.0.26102101)'
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    if: github.repository == 'zhini-co-in/kondaas-service'
+
+    steps:
+      - name: SSH and Deploy Container
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          script: |
+            IMAGE="ghcr.io/zhini-co-in/kondaas:${{ github.event.inputs.image_tag }}"
+            echo "Pulling Docker image: $IMAGE"
+            docker pull "$IMAGE"
+
+            echo "Stopping old container if running..."
+            docker stop kondaas || true
+            docker rm kondaas || true
+
+            echo "Starting new container..."
+            docker run -d \
+              --name kondaas \
+              --restart always \
+              -p 127.0.0.1:3000:8080 \
+              -v /home/deploy/firebase-key.json:/app/firebase-key.json:ro \
+              -e TZ="Asia/Kolkata" \
+              -e MONGODB_URI="mongodb://dev_db_user:7cBNvaJmiJdasAgJ@ac-epobvi7-shard-00-00.dhu5rvl.mongodb.net:27017,ac-epobvi7-shard-00-01.dhu5rvl.mongodb.net:27017,ac-epobvi7-shard-00-02.dhu5rvl.mongodb.net:27017/kondaas_prod?ssl=true&replicaSet=atlas-je3c22-shard-0&authSource=admin&appName=kondaas" \
+              "$IMAGE"
+
+            echo "Cleaning up dangling/unused images..."
+            docker image prune -af
+
+            echo "Container status:"
+            docker ps --filter "name=kondaas"
