@@ -45,7 +45,7 @@ if (!admin.apps.length) {
     credential: firebaseCredential,
     ...(detectedProjectId ? { projectId: detectedProjectId } : {})
   });
-  console.log(`✅ Firebase Admin initialized for project: ${detectedProjectId || 'Default'}`);
+  console.log(`✅ Firebase Admin initialized for project!!!: ${detectedProjectId || 'Default'}`);
 }
 
 
