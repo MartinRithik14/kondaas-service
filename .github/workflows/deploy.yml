@@ -16,12 +16,21 @@ jobs:
     steps:
       - name: SSH and Deploy Container
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
+          envs: GHCR_TOKEN
           script: |
+            set -e
+
             IMAGE="ghcr.io/zhini-co-in/kondaas:${{ github.event.inputs.image_tag }}"
+
+            echo "Logging into GHCR on host..."
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
             echo "Pulling Docker image: $IMAGE"
             docker pull "$IMAGE"
 
@@ -39,8 +48,8 @@ jobs:
               -e MONGODB_URI="mongodb://dev_db_user:7cBNvaJmiJdasAgJ@ac-epobvi7-shard-00-00.dhu5rvl.mongodb.net:27017,ac-epobvi7-shard-00-01.dhu5rvl.mongodb.net:27017,ac-epobvi7-shard-00-02.dhu5rvl.mongodb.net:27017/kondaas_prod?ssl=true&replicaSet=atlas-je3c22-shard-0&authSource=admin&appName=kondaas" \
               "$IMAGE"
 
-            echo "Cleaning up dangling/unused images..."
-            docker image prune -af
+            echo "Cleaning up dangling images..."
+            docker image prune -f
 
             echo "Container status:"
             docker ps --filter "name=kondaas"
