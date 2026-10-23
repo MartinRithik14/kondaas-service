@@ -124,25 +124,139 @@ export const getCurrentLocation = async (c) => {
   }
 };
 
+/**
+ * Calculates road distance in kilometers using Google Routes API (v2)
+ */
+async function fetchGoogleDistanceKm(startLat, startLng, siteLat, siteLng) {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) {
+    throw new Error("GOOGLE_MAPS_API_KEY is not configured in environment variables");
+  }
+
+  const payload = {
+    origin: {
+      location: {
+        latLng: {
+          latitude: Number(startLat),
+          longitude: Number(startLng)
+        }
+      }
+    },
+    destination: {
+      location: {
+        latLng: {
+          latitude: Number(siteLat),
+          longitude: Number(siteLng)
+        }
+      }
+    },
+    travelMode: "DRIVE"
+  };
+
+  const res = await fetch("https://routes.googleapis.com/directions/v2:computeRoutes", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": apiKey,
+      "X-Goog-FieldMask": "routes.distanceMeters,routes.duration"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Routes API HTTP error: ${res.status} - ${errorText}`);
+  }
+
+  const data = await res.json();
+
+
+  const route = data.routes?.[0];
+  if (!route) {
+    throw new Error("No route found between coordinates");
+  }
+
+  // If distanceMeters is omitted, Google calculated 0 meters (start and end are the same spot)
+  const distanceMeters = route.distanceMeters ?? 0;
+  const distanceKm = Math.round((distanceMeters / 1000) * 100) / 100;
+  return distanceKm;
+}
+
 export const saveDealDistance = async (c) => {
   try {
-    const { deal_id, deal_name, mobile, to_site, to_home, to_office, surveyor_name} = await c.req.json();
+    const body = await c.req.json();
 
-    // Mandatory fields validation
-    if (!deal_id || !deal_name || to_site === undefined || to_site === null|| !mobile || !surveyor_name) {
-      return c.json({ error: "deal_id, deal_name, mobile, and to_site are required!" }, 400);
+    const {
+      deal_id,
+      deal_name,
+      mobile,
+      surveyor_name,
+      // Existing mobile-calculated fields preserved as before
+      to_home,
+      to_office,
+      // Coordinates needed strictly for server-side to_site calculation
+      start_latitude,
+      start_longitude,
+      site_latitude,
+      site_longitude,
+      start_lat,
+      start_lng,
+      site_lat,
+      site_lng
+    } = body;
+
+    // Resolve lat/lng from common naming variants
+    const resolvedStartLat = start_latitude ?? start_lat;
+    const resolvedStartLng = start_longitude ?? start_lng;
+    const resolvedSiteLat = site_latitude ?? site_lat;
+    const resolvedSiteLng = site_longitude ?? site_lng;
+
+    // 1. Mandatory validation
+    if (
+      !deal_id ||
+      !deal_name ||
+      !mobile ||
+      !surveyor_name ||
+      resolvedStartLat === undefined ||
+      resolvedStartLng === undefined ||
+      resolvedSiteLat === undefined ||
+      resolvedSiteLng === undefined
+    ) {
+      return c.json(
+        {
+          error: "deal_id, deal_name, mobile, surveyor_name, and valid start/site coordinates are required!"
+        },
+        400
+      );
     }
 
-    // Build the document dynamically
+    // 2. Compute to_site distance exclusively using Google Maps API
+    const calculatedToSiteKm = await fetchGoogleDistanceKm(
+      resolvedStartLat,
+      resolvedStartLng,
+      resolvedSiteLat,
+      resolvedSiteLng
+    );
+
+    // 3. Build MongoDB document
     const distanceData = {
       deal_id,
       deal_name,
       mobile,
-      to_site,
+      to_site: calculatedToSiteKm, // Server-calculated km
       surveyor_name,
+      start_location: {
+        latitude: Number(resolvedStartLat),
+        longitude: Number(resolvedStartLng)
+      },
+      site_location: {
+        latitude: Number(resolvedSiteLat),
+        longitude: Number(resolvedSiteLng)
+      },
       createdAt: new Date()
     };
 
+    // 4. Attach legacy mobile-computed distances untouched if supplied
     if (to_home !== undefined && to_home !== null) {
       distanceData.to_home = to_home;
     }
@@ -151,27 +265,22 @@ export const saveDealDistance = async (c) => {
       distanceData.to_office = to_office;
     }
 
-    // Execute database operations using withDatabase wrapper
+    // 5. Database persistence
     return await withDatabase(MONGODB_URI, async (db) => {
       const collection = db.collection("deal_distance");
 
-      // 1. Check for existing record with the same deal_id
+      // Verify no duplicate record exists
       const existingRecord = await collection.findOne({ deal_id });
       if (existingRecord) {
         return c.json({ error: "A distance record for this deal_id already exists!" }, 409);
       }
 
-      // 2. Insert new record if no duplicate exists
-      const result = await collection.insertOne(distanceData);
+      await collection.insertOne(distanceData);
 
-      return c.json({
-        message: "Deal distance saved successfully",
-        insertedId: result.insertedId,
-        data: distanceData
-      }, 201);
+      return c.json({ message: "Deal distance saved successfully" }, 201);
     });
-
   } catch (err) {
+    console.error("❌ saveDealDistance execution failed:", err.message);
     return c.json({ error: err.message }, 500);
   }
 };
