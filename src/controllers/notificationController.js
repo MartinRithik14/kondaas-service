@@ -70,7 +70,10 @@ export const processWhatsAppNotification = async (notificationId) => {
   try {
     await withDatabase(MONGODB_URI, async (db) => {
       const keys = await getSystemKeys(db);
-      const { apiUrl: BASE_URL, apiKey: API_KEY } = keys.whatsapp;
+
+      if (!keys.interakt || !keys.interakt.apiKey) {
+        throw new Error("Interakt credentials are not configured in system_keys.");
+      }
 
       const notification = await db.collection("notifications").findOneAndUpdate(
         { _id: notificationId, status: "pending" },
@@ -80,89 +83,35 @@ export const processWhatsAppNotification = async (notificationId) => {
 
       if (!notification) return;
 
-      const type = notification.contentType;
-      const formattedNumber = `91${notification.to}`;
-      const contentString = notification.content.buffer.toString("utf8");
+      const contentString = notification.content?.buffer 
+        ? notification.content.buffer.toString("utf8") 
+        : (notification.content || "");
 
-      let action;
-      let payload = { number: formattedNumber };
-
-      if (type === "text") {
-        action = "sendText/kondaas";
-        payload.text = contentString;
-      } else if (type === "poll") {
-        action = "sendPoll/kondaas";
-        payload.name = contentString;
-        payload.selectableCount = 1;
-        payload.values = ["1", "2", "3", "4", "5"];
-      } else {
-        action = "sendMedia/kondaas";
-        payload = {
-          ...payload,
-          mediatype: "document",
-          media: contentString,
-          fileName: "Kondaas_Invoice.pdf",
-          caption: notification.caption || "Thank you for choosing Kondaas!"
-        };
+      const templateInfo = resolveInteraktTemplate(notification, contentString);
+      if (!templateInfo) {
+        throw new Error(`No matching Interakt template could be resolved for notification ${notificationId}`);
       }
 
-      // --- PRIMARY: TRY EVOLUTION API ---
-      let sentSuccessfully = false;
-      let usedProvider = "evolution";
-
-      try {
-        const response = await fetch(`${BASE_URL}${action}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "apikey": API_KEY },
-          body: JSON.stringify(payload)
-        });
-
-        if (response.ok) {
-          sentSuccessfully = true;
-        } else {
-          const errorData = await response.text();
-          console.warn(`⚠️ Evolution failed with status ${response.status}: ${errorData}. Attempting Interakt fallback...`);
-        }
-      } catch (evolutionErr) {
-        console.warn(`⚠️ Evolution network error: ${evolutionErr.message}. Attempting Interakt fallback...`);
-      }
-
-      // --- SECONDARY: FALLBACK TO INTERAKT ---
-      if (!sentSuccessfully) {
-        if (!keys.interakt || !keys.interakt.apiKey) {
-          throw new Error("Evolution failed and Interakt credentials are not configured in system_keys.");
-        }
-
-        const templateInfo = resolveInteraktTemplate(notification, contentString);
-        if (!templateInfo) {
-          throw new Error("Evolution failed and no matching Interakt template could be resolved for this notification.");
-        }
-
-        console.log(`📡 Sending fallback via Interakt template: ${templateInfo.templateName}...`);
-        await sendViaInterakt({
-          interaktConfig: keys.interakt,
-          to: notification.to,
-          templateName: templateInfo.templateName,
-          bodyValues: templateInfo.bodyValues
-        });
-
-        sentSuccessfully = true;
-        usedProvider = "interakt";
-      }
+      console.log(`📡 Sending WhatsApp via Interakt template: ${templateInfo.templateName}...`);
+      await sendViaInterakt({
+        interaktConfig: keys.interakt,
+        to: notification.to,
+        templateName: templateInfo.templateName,
+        bodyValues: templateInfo.bodyValues,
+        ...(templateInfo.headerValues && { headerValues: templateInfo.headerValues })
+      });
 
       // --- RECORD SUCCESS ---
-      if (sentSuccessfully) {
-        await db.collection("notifications").updateOne(
-          { _id: notificationId },
-          {
-            $set: {
-              status: "completed",
-              completedAt: new Date(),
-              providerUsed: usedProvider
-            }
+      await db.collection("notifications").updateOne(
+        { _id: notificationId },
+        {
+          $set: {
+            status: "completed",
+            completedAt: new Date(),
+            providerUsed: "interakt"
           }
-        );
-      }
+        }
+      );
     });
   } catch (err) {
     console.error("❌ WhatsApp Task Failed Completely:", err.message);
@@ -314,10 +263,6 @@ const formatZohoUrl = (url) => {
   if (!url) return "";
   return String(url).trim();
 };
-
-// ==========================================
-// Controller Function
-// ==========================================
 
 export const triggerScenarioNotification = async (c) => {
   try {
