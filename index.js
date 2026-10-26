@@ -125,7 +125,7 @@ serve({
   port,
   hostname: '0.0.0.0'
 }, (info) => {
-  console.log(`🚀 Kondaaas Backend Live: http://localhost:${info.port}`);
+  console.log(`🚀 Kondaas Backend Live: http://localhost:${info.port}`);
 });
 
 // 🕒 START THE BACKGROUND QUEUE RUNNER HERE 
