@@ -49,7 +49,7 @@ jobs:
               "$IMAGE"
 
             echo "Cleaning up dangling images..."
-            docker image prune -f
+            docker image prune -af
 
             echo "Container status:"
             docker ps --filter "name=kondaas"
