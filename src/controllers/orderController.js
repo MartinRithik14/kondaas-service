@@ -1095,25 +1095,52 @@ export const zohoWorkflowAssignment = async (c) => {
 
 export const getSurveyorDeals = async (c) => {
   try {
-    // Grab the logged-in surveyor's mobile number sent from their app
-    const { surveyorNumber } = c.req.query();
+    // 1. Grab query params from the incoming request
+    const query = c.req.query();
+    const surveyorNumber = query.surveyorNumber;
 
     if (!surveyorNumber) {
       return c.json({ error: "Missing surveyor identity verification parameter" }, 400);
     }
 
+    // 2. Parse and sanitize pagination parameters with sensible defaults
+    const page = Math.max(1, parseInt(query.page || "1", 10));
+    const limit = Math.max(1, Math.min(100, parseInt(query.limit || "10", 10))); // Default 10, capped at 100
+    const skip = (page - 1) * limit;
+
     return await withDatabase(MONGODB_URI, async (db) => {
+      const filter = { assignedTo: surveyorNumber };
 
-      // Query the deals collection looking strictly for matches against their phone number
-      const assignedDeals = await db.collection("deals")
-        .find({ assignedTo: surveyorNumber })
-        .sort({ assignedAt: -1 }) // Sort so newest jobs pop up first
-        .toArray();
+      // 3. Run query and total count concurrently for performance
+      const [assignedDeals, totalDeals] = await Promise.all([
+        db.collection("deals")
+          .find(filter)
+          .sort({ assignedAt: -1 }) // Newest jobs always first
+          .skip(skip)
+          .limit(limit)
+          .toArray(),
+        db.collection("deals").countDocuments(filter)
+      ]);
 
-      console.log(`📱 Surveyor Workspace [${surveyorNumber}] loaded. Sent back ${assignedDeals.length} detailed tasks.`);
+      const totalPages = Math.ceil(totalDeals / limit);
+      const hasMore = page < totalPages;
 
-      // Send the entire structure back exactly how the UI models expect it
-      return c.json({ success: true, deals: assignedDeals }, 200);
+      console.log(
+        `📱 Surveyor Workspace [${surveyorNumber}] - Page ${page}/${totalPages || 1} loaded. Sent ${assignedDeals.length} tasks (Total: ${totalDeals}).`
+      );
+
+      // 4. Return deals along with metadata tailored for React Native FlatList
+      return c.json({
+        success: true,
+        deals: assignedDeals,
+        pagination: {
+          total: totalDeals,
+          page,
+          limit,
+          totalPages,
+          hasMore // Tells React Native's onEndReached whether to fetch next page
+        }
+      }, 200);
     });
 
   } catch (err) {
