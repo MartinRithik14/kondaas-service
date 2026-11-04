@@ -1149,6 +1149,66 @@ export const getSurveyorDeals = async (c) => {
   }
 };
 
+//Notes section on Deals on Zoho CRM 
+export const addDealNote = async (c) => {
+  try {
+    const { deal_id, content } = await c.req.json();
+
+    // 1. Validation
+    if (!deal_id) {
+      return c.json({ error: "Missing required parameter: 'deal_id'" }, 400);
+    }
+
+    if (!content || !String(content).trim()) {
+      return c.json({ error: "Missing required parameter: 'content'" }, 400);
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      // 2. Retrieve Zoho Access Token
+      const zohoToken = await getZohoAccessToken(db);
+
+      // 3. Prepare Note Payload for Zoho CRM
+      const notePayload = {
+        Note_Title: "Note",
+        Note_Content: String(content).trim()
+      };
+
+      // 4. Attach Note to Deal via Related List Endpoint
+      const zohoResponse = await fetch(`https://www.zohoapis.in/crm/v8/Deals/${deal_id}/Notes`, {
+        method: "POST",
+        headers: {
+          Authorization: `Zoho-oauthtoken ${zohoToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ data: [notePayload] })
+      });
+
+      const result = await zohoResponse.json();
+
+      if (!zohoResponse.ok || (result.data && result.data[0]?.status === "error")) {
+        console.error("❌ Zoho CRM Note creation error:", JSON.stringify(result));
+        return c.json(
+          {
+            error: "Failed to create note in Zoho CRM",
+            details: result
+          },
+          zohoResponse.status >= 400 ? zohoResponse.status : 500
+        );
+      }
+
+      console.log(`✅ Note added to Deal [${deal_id}] successfully`);
+      return c.json({
+        success: true,
+        message: "Note added successfully",
+        data: result.data?.[0] || result
+      });
+    });
+  } catch (error) {
+    console.error("❌ Error in addDealNote handler:", error.message);
+    return c.json({ error: "Internal Server Error", details: error.message }, 500);
+  }
+};
+
 
 
 export const zohoDealCreatedWebhook = async (c) => {
