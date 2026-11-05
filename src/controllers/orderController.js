@@ -466,62 +466,41 @@ export const updateSurveyStatus = async (c) => {
 export const getOrders = async (c) => {
   try {
     return await withDatabase(MONGODB_URI, async (db) => {
-      // 🔐 Grab active authorization credentials dynamically out of RAM / config collection
-      const zohoToken = await getZohoAccessToken(db);
+      console.log("📡 Fetching all deals directly from MongoDB...");
 
-      // 🏷️ Requesting all necessary Deal layout parameters from Zoho CRM
-      const fieldsParam = "id,Deal_Name,Contact_Name,Mobile,WhatsApp_Number,Email,Stage,Description,Wattage_Required,Created_Time,Site_Survey_Status," +
-        "Address_City,Address_Street_Address,Address_Coordinates_Latitude,Address_Coordinates_Longitude," +
-        "City,Street_Address,Latitude,Longitude";
+      // Fetch all documents from the 'deals' collection
+      const deals = await db.collection("deals").find({}).toArray();
 
-      console.log("📡 Admin Dashboard: Fetching active records from Zoho Deals engine...");
-
-      const response = await fetch(`https://www.zohoapis.in/crm/v8/Deals?fields=${fieldsParam}&per_page=50`, {
-        method: "GET",
-        headers: {
-          "Authorization": `Zoho-oauthtoken ${zohoToken}`,
-          "Content-Type": "application/json"
-        }
-      });
-
-      if (!response.ok) {
-        const errTxt = await response.text();
-        console.error("❌ Zoho Fetch Deals failed for Admin:", errTxt);
-        return c.json({ error: "Failed to retrieve records from Zoho Deals module." }, 500);
-      }
-
-      const result = await response.json();
-
-      // Remap Zoho API Deal fields to clean, standardized JSON keys for your Admin Mobile UI
-      const orders = (result.data || []).map(deal => {
-        const rawStatus = deal.Site_Survey_Status || "";
-        const cleanedSurveyStatus = rawStatus.toLowerCase().replace('-', '').trim();
+      // Standardize the shape so mobile clients get a clean, consistent response
+      const orders = deals.map((deal) => {
+        const rawStatus = deal.Site_Survey_Status || deal.siteSurveyStatus || "";
+        const cleanedSurveyStatus = rawStatus.toLowerCase().replace("-", "").trim();
 
         return {
-          id: deal.id,
-          name: deal.Deal_Name || (deal.Contact_Name ? deal.Contact_Name.name : "Unknown Customer"),
-          mobile: deal.Mobile || deal.Contact_Number || null,
-          whatsappNo: deal.WhatsApp_Number || null,
-          email: deal.Email || null,
+          id: deal._id ? deal._id.toString() : deal.id,
+          deal_id: deal.deal_id || deal.id || null,
+          name: deal.deal_name || deal.name || (deal.Contact_Name ? deal.Contact_Name.name : "Unknown Customer"),
+          mobile: deal.Mobile || deal.mobile || deal.Contact_Number || null,
+          whatsappNo: deal.WhatsApp_Number || deal.whatsappNo || null,
+          email: deal.Email || deal.email || null,
 
-          // Dual Fallback Mapping logic matching your current CRM setup layouts
-          city: deal.Address_City || deal.City || null,
-          address: deal.Address_Street_Address || deal.Street_Address || null,
-          latitude: deal.Address_Coordinates_Latitude || deal.Latitude || null,
-          longitude: deal.Address_Coordinates_Longitude || deal.Longitude || null,
+          city: deal.city || deal.City || null,
+          address: deal.street ||deal.address || null,
+          latitude: deal.Address_Coordinates_Latitude || deal.Latitude || deal.latitude || null,
+          longitude: deal.Address_Coordinates_Longitude || deal.Longitude || deal.longitude || null,
 
-          comment: deal.Description || "",
+          comment: deal.Description || deal.comment || "",
+          
           siteSurveyStatus: cleanedSurveyStatus || "accepted",
 
-          // Extract the profile creation timestamp cleanly
-          date: deal.Created_Time || null
+          date: deal.Created_Time || deal.date || deal.createdAt || null
         };
       });
 
       return c.json(orders);
     });
   } catch (err) {
-    console.error("❌ GetOrders (Deals Mapping) Error Exception:", err.message);
+    console.error("❌ GetOrders (DB Fetch) Error Exception:", err.message);
     return c.json({ error: "Internal server error" }, 500);
   }
 };
