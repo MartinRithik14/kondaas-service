@@ -188,6 +188,7 @@ export const saveDealDistance = async (c) => {
 
     const {
       deal_id,
+      state,
       deal_name,
       mobile,
       surveyor_name,
@@ -243,6 +244,7 @@ export const saveDealDistance = async (c) => {
       deal_id,
       deal_name,
       mobile,
+      state,
       to_site: calculatedToSiteKm, // Server-calculated km
       surveyor_name,
       start_location: {
