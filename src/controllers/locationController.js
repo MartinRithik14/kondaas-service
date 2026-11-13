@@ -288,4 +288,133 @@ export const saveDealDistance = async (c) => {
 };
 
 
+export const recordAttendance = async (c) => {
+  try {
+    const body = await c.req.json();
+    const { mobilenumber, number, role, checkin, checkout } = body;
 
+    // 1. Normalize and validate mobile number
+    let phoneNo = mobilenumber || number;
+    if (!phoneNo) {
+      return c.json({ error: "Mobile number is required (mobilenumber or number)" }, 400);
+    }
+
+    phoneNo = String(phoneNo).replace(/\D/g, "");
+    if (phoneNo.length === 12 && phoneNo.startsWith("91")) {
+      phoneNo = phoneNo.substring(2);
+    }
+
+    // 2. Validate that at least checkin or checkout is provided
+    if (!checkin && !checkout) {
+      return c.json({ error: "Either 'checkin' or 'checkout' time must be provided" }, 400);
+    }
+
+    // 3. Resolve the date key (YYYY-MM-DD)
+    const targetTimestamp = checkin || checkout;
+    const parsedDate = !isNaN(new Date(targetTimestamp).getTime())
+      ? new Date(targetTimestamp)
+      : new Date();
+    const dateStr = parsedDate.toISOString().split("T")[0];
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      const collection = db.collection("attendance");
+
+      // 4. Ensure document exists for this phone number
+      await collection.updateOne(
+        { phoneNo },
+        {
+          $setOnInsert: { phoneNo, history: [] },
+          $set: {
+            updatedAt: new Date(),
+            ...(role ? { role } : {})
+          }
+        },
+        { upsert: true }
+      );
+
+      // Fetch the current document to inspect the day's existing sessions
+      const userDoc = await collection.findOne({ phoneNo });
+      const dayRecord = (userDoc.history || []).find((h) => h.date === dateStr);
+
+      if (!dayRecord) {
+        // First entry of the day -> create the date record with its first session
+        const initialSession = {
+          ...(checkin ? { checkin } : {}),
+          ...(checkout ? { checkout } : {})
+        };
+
+        await collection.updateOne(
+          { phoneNo },
+          {
+            $push: {
+              history: {
+                date: dateStr,
+                sessions: [initialSession]
+              }
+            }
+          }
+        );
+      } else {
+        // Date entry exists -> determine session update
+        const sessions = dayRecord.sessions || [];
+        const lastSessionIndex = sessions.length - 1;
+        const lastSession = sessions[lastSessionIndex];
+
+        if (checkin && !checkout) {
+          // New check-in -> append a new session to the day's list
+          await collection.updateOne(
+            { phoneNo, "history.date": dateStr },
+            {
+              $push: {
+                "history.$.sessions": { checkin }
+              }
+            }
+          );
+        } else if (checkout && !checkin) {
+          // Check-out only -> close the latest session if open, else create a new session entry
+          if (lastSession && !lastSession.checkout) {
+            const fieldKey = `history.$.sessions.${lastSessionIndex}.checkout`;
+            await collection.updateOne(
+              { phoneNo, "history.date": dateStr },
+              { $set: { [fieldKey]: checkout } }
+            );
+          } else {
+            await collection.updateOne(
+              { phoneNo, "history.date": dateStr },
+              {
+                $push: {
+                  "history.$.sessions": { checkout }
+                }
+              }
+            );
+          }
+        } else {
+          // Both checkin & checkout provided together
+          await collection.updateOne(
+            { phoneNo, "history.date": dateStr },
+            {
+              $push: {
+                "history.$.sessions": { checkin, checkout }
+              }
+            }
+          );
+        }
+      }
+
+      return c.json({
+        success: true,
+        message: "Attendance recorded successfully",
+        phoneNo,
+        date: dateStr,
+        data: {
+          role: role || undefined,
+          checkin: checkin || undefined,
+          checkout: checkout || undefined
+        }
+      });
+    });
+  } catch (err) {
+    console.error("❌ Attendance Record Error Exception:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
+  }
+};
