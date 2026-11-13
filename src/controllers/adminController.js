@@ -410,3 +410,27 @@ export const getDealDistance = async (c) => {
     return c.json({ error: err.message }, 500);
   }
 };
+
+
+export const getAllAttendance = async (c) => {
+  try {
+    return await withDatabase(MONGODB_URI, async (db) => {
+      // 1. Fetch all documents from the attendance collection
+      const docs = await db.collection("attendance").find({}).toArray();
+
+      // 2. Map documents to clean, standardized response objects
+      const result = docs.map((doc) => ({
+        id: doc._id ? doc._id.toString() : null,
+        phoneNo: doc.phoneNo || null,
+        role: doc.role || null,
+        history: doc.history || [],
+        updatedAt: doc.updatedAt || null
+      }));
+
+      return c.json(result);
+    });
+  } catch (err) {
+    console.error("❌ GetAllAttendance Error Exception:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
+  }
+};

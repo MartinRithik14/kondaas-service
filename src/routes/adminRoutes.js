@@ -1,10 +1,11 @@
 import { Hono } from 'hono';
 
-import { getDealInfo,assignLogisticsMember,getLogRejections,getDealDistance,getLogCompletions,assignInstallerMember,getInstallerRejections,getInstallerCompletions,whitelistUser } from '../controllers/adminController.js';
+import { getDealInfo,getAllAttendance,assignLogisticsMember,getLogRejections,getDealDistance,getLogCompletions,assignInstallerMember,getInstallerRejections,getInstallerCompletions,whitelistUser } from '../controllers/adminController.js';
 
 const adminRoutes = new Hono();
 
 adminRoutes.get('/products', getDealInfo);
+adminRoutes.get("/attendance", getAllAttendance);
 adminRoutes.post('/assign-role', whitelistUser);
 adminRoutes.get('/distance', getDealDistance);
 
