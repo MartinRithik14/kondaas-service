@@ -126,100 +126,173 @@ export const getCurrentLocation = async (c) => {
 };
 
 
-export const getInstallerDealsByMobile = async (c) => {
-  try {
-    // 1. Grab the mobile number from the query string parameters (e.g., ?mobile=6666666666)
-    const mobile = c.req.query("mobile");
 
-    if (!mobile) {
-      return c.json({ success: false, error: "Missing mobile query parameter" }, 400);
+
+
+
+
+
+export const installationWebhook = async (c) => {
+  try {
+    // 1. Parse incoming payload (handles JSON, urlencoded, or multipart)
+    const contentType = c.req.header("content-type") || "";
+    let payload = {};
+
+    if (contentType.includes("application/json")) {
+      payload = await c.req.json();
+    } else if (
+      contentType.includes("application/x-www-form-urlencoded") ||
+      contentType.includes("multipart/form-data")
+    ) {
+      payload = await c.req.parseBody();
+    } else {
+      try {
+        payload = await c.req.json();
+      } catch {
+        payload = await c.req.parseBody();
+      }
     }
 
-    return await withDatabase(MONGODB_URI, async (db) => {
-      // 2. Fetch all assignments matching this mobile number
-      const deals = await db
-        .collection("Installer_deals")
-        .find({ mobile: mobile })
-        .sort({ assignedAt: -1 }) // ✨ Newest runs appear at the top of their screen
-        .toArray();
+    // 2. Extract incoming fields
+    const {
+      id,
+      installerMobile,
+      installerNumber,
+      longitude,
+      latitude,
+      country,
+      postalCode,
+      province,
+      city,
+      street,
+      leadSource,
+      customerName
+    } = payload;
 
-      // 3. Return the array to populate the app's list view
+    // Validate Zoho record ID
+    const zohoId = id || payload.record_id;
+    if (!zohoId) {
+      console.warn("⚠️ Installation Webhook received without an ID:", payload);
+      return c.json({ error: "Missing record ID from Zoho" }, 400);
+    }
+
+    // 3. Resolve and normalize assignedTo phone number (10 digits)
+    let rawPhone = installerMobile || installerNumber || "";
+    let assignedTo = String(rawPhone).replace(/\D/g, "");
+    if (assignedTo.length === 12 && assignedTo.startsWith("91")) {
+      assignedTo = assignedTo.substring(2);
+    }
+
+    // 4. Construct installation document
+    const installationData = {
+      zohoId: String(zohoId),
+      assignedTo: assignedTo || null,
+      installerMobile: installerMobile || null,
+      installerNumber: installerNumber || null,
+      customerName: customerName || null,
+      leadSource: leadSource || null,
+      location: {
+        latitude: latitude ? parseFloat(latitude) || latitude : null,
+        longitude: longitude ? parseFloat(longitude) || longitude : null
+      },
+      address: {
+        street: street || null,
+        city: city || null,
+        province: province || null,
+        postalCode: postalCode || null,
+        country: country || null
+      },
+      status: "assigned",
+      updatedAt: new Date()
+    };
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      // 5. Upsert into the 'installation' collection
+      await db.collection("installation").updateOne(
+        { zohoId: String(zohoId) },
+        {
+          $set: installationData,
+          $setOnInsert: { createdAt: new Date() }
+        },
+        { upsert: true }
+      );
+
+      console.log(`✅ Installation record synced: ${zohoId} assigned to ${assignedTo}`);
+
       return c.json({
         success: true,
-        count: deals.length,
-        data: deals
-      }, 200);
+        message: "Installation record synced successfully",
+        zohoId,
+        assignedTo
+      });
     });
-
   } catch (err) {
-    console.error("❌ Fetching Logistics Deals Exception:", err.message);
-    return c.json({ success: false, error: "Failed to retrieve logistics assignments" }, 500);
+    console.error("❌ Installation Webhook Error Exception:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
   }
 };
 
 
-export const notifyInstallerETA = async (c) => {
+export const getInstallerInstallations = async (c) => {
   try {
-    const body = await c.req.json();
-    const { logisticMemberNumber, installerNumber, eta } = body;
+    // 1. Grab query params from the incoming request
+    const query = c.req.query();
+    let installerNumber = query.installerNumber || query.installerMobile;
 
-    // Fast validation check
-    if (!installerNumber || !eta) {
-      return c.json({ error: "Missing required fields: installerNumber or eta" }, 400);
+    if (!installerNumber) {
+      return c.json({ error: "Missing installer identity verification parameter" }, 400);
     }
 
+    // Normalize phone number to 10 digits to match the assignedTo storage format
+    installerNumber = String(installerNumber).replace(/\D/g, "");
+    if (installerNumber.length === 12 && installerNumber.startsWith("91")) {
+      installerNumber = installerNumber.substring(2);
+    }
+
+    // 2. Parse and sanitize pagination parameters
+    const page = Math.max(1, parseInt(query.page || "1", 10));
+    const limit = Math.max(1, Math.min(100, parseInt(query.limit || "10", 10)));
+    const skip = (page - 1) * limit;
+
     return await withDatabase(MONGODB_URI, async (db) => {
-      
-      // 1. Look up the targeted installer's profile to fetch their active device tokens
-      const installerProfile = await db.collection("userDetails").findOne({
-        "UserInfo.phoneNo": installerNumber,
-        "UserInfo.role": "installer"
-      });
+      const filter = { assignedTo: installerNumber };
 
-      if (!installerProfile) {
-        console.log(`⚠️ Installer profile not found for phone number: ${installerNumber}`);
-        return c.json({ error: "Target installer profile not found" }, 404);
-      }
+      // 3. Run query and total count concurrently for performance
+      const [assignedInstallations, totalInstallations] = await Promise.all([
+        db.collection("installation")
+          .find(filter)
+          .sort({ createdAt: -1 }) // Newest jobs first
+          .skip(skip)
+          .limit(limit)
+          .toArray(),
+        db.collection("installation").countDocuments(filter)
+      ]);
 
-      // 2. Extract tokens from the installer's devices array
-      let installerTokens = [];
-      const devices = installerProfile.PlatformInfo?.devices;
-      if (devices && Array.isArray(devices)) {
-        devices.forEach((device) => {
-          if (device.fcmToken) {
-            installerTokens.push(device.fcmToken);
+      const totalPages = Math.ceil(totalInstallations / limit);
+      const hasMore = page < totalPages;
+
+      console.log(
+        `📱 Installer Workspace [${installerNumber}] - Page ${page}/${totalPages || 1} loaded. Sent ${assignedInstallations.length} tasks (Total: ${totalInstallations}).`
+      );
+
+      // 4. Return installation jobs along with FlatList-ready pagination metadata
+      return c.json(
+        {
+          success: true,
+          installations: assignedInstallations,
+          pagination: {
+            total: totalInstallations,
+            page,
+            limit,
+            totalPages,
+            hasMore
           }
-        });
-      }
-
-      // 3. Send standard push notification to this specific installer
-      if (installerTokens.length > 0) {
-        const message = {
-          notification: {
-            title: "Delivery Coming Your Way! 🚚",
-            body: `Logistics member (${logisticMemberNumber || 'Team'}) is arriving. ETA: ${eta}.`,
-          },
-          data: {
-            click_action: "FLUTTER_NOTIFICATION_CLICK",
-            type: "DELIVERY_ETA"
-          },
-          tokens: installerTokens,
-        };
-
-        const response = await admin.messaging().sendEachForMulticast(message);
-        console.log(`🚀 ETA push alert sent to installer (${installerNumber}). Success count: ${response.successCount}`);
-      } else {
-        console.log(`⚠️ Installer found, but no active FCM tokens registered for phone: ${installerNumber}`);
-      }
-
-      return c.json({ 
-        success: true, 
-        message: "Installer successfully notified of incoming logistics arrival." 
-      }, 200);
+        },
+        200
+      );
     });
-
   } catch (err) {
-    console.error("❌ NotifyInstallerETA Endpoint Error:", err.message);
-    return c.json({ error: "Internal server error during ETA alert delivery" }, 500);
+    console.error("❌ Fetch Installer Dashboard Exception:", err.message);
+    return c.json({ error: "Failed to pull installer task workspace" }, 500);
   }
 };
