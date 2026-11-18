@@ -1,5 +1,5 @@
 import { withDatabase } from '../utils/config.js'; 
-import admin from "firebase-admin";
+import { getZohoAccessToken } from '../utils/zohoAuth.js';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
@@ -127,11 +127,6 @@ export const getCurrentLocation = async (c) => {
 
 
 
-
-
-
-
-
 export const installationWebhook = async (c) => {
   try {
     // 1. Parse incoming payload (handles JSON, urlencoded, or multipart)
@@ -156,32 +151,58 @@ export const installationWebhook = async (c) => {
     // 2. Extract incoming fields
     const {
       id,
-      installerMobile,
       installerNumber,
-      longitude,
-      latitude,
-      country,
-      postalCode,
-      province,
-      city,
+      installerMobile,
+      customerName,
+      customerPhone,
+      customerMobile,
       street,
-      leadSource,
-      customerName
+      city,
+      province,
+      postalCode,
+      country,
+      latitude,
+      longitude,
+      // Product & Material details
+      inverterModel,
+      inverterCapacity,
+      inverterConnectionType,
+      inverterBrand,
+      solarPanelType,
+      solarPanelBrand,
+      noOfPanels,
+      cableRequirements,
+      acCable,
+      dcCable,
+      earthingCable,
+      additionalMaterialReq,
+      requiredAdditionalMaterial,
+      additionalMaterialCost
     } = payload;
 
-    // Validate Zoho record ID
+    // Validate Zoho record ID (sent via User defined Format)
     const zohoId = id || payload.record_id;
     if (!zohoId) {
       console.warn("⚠️ Installation Webhook received without an ID:", payload);
       return c.json({ error: "Missing record ID from Zoho" }, 400);
     }
 
-    // 3. Resolve and normalize assignedTo phone number (10 digits)
-    let rawPhone = installerMobile || installerNumber || "";
-    let assignedTo = String(rawPhone).replace(/\D/g, "");
-    if (assignedTo.length === 12 && assignedTo.startsWith("91")) {
-      assignedTo = assignedTo.substring(2);
-    }
+    // Helper: clean & normalize phone numbers to standard 10 digits
+    const normalizePhoneNumber = (number) => {
+      if (!number) return null;
+      let digits = String(number).replace(/\D/g, "");
+      if (digits.length === 12 && digits.startsWith("91")) {
+        digits = digits.substring(2);
+      }
+      return digits || null;
+    };
+
+    // 3. Resolve and normalize phone numbers
+    const rawInstallerPhone = installerMobile || installerNumber || "";
+    const assignedTo = normalizePhoneNumber(rawInstallerPhone);
+
+    const rawCustomerPhone = customerMobile || customerPhone || "";
+    const normalizedCustomerPhone = normalizePhoneNumber(rawCustomerPhone);
 
     // 4. Construct installation document
     const installationData = {
@@ -190,7 +211,9 @@ export const installationWebhook = async (c) => {
       installerMobile: installerMobile || null,
       installerNumber: installerNumber || null,
       customerName: customerName || null,
-      leadSource: leadSource || null,
+      customerPhone: normalizedCustomerPhone,
+      customerRawPhone: customerPhone || null,
+      customerRawMobile: customerMobile || null,
       location: {
         latitude: latitude ? parseFloat(latitude) || latitude : null,
         longitude: longitude ? parseFloat(longitude) || longitude : null
@@ -202,7 +225,23 @@ export const installationWebhook = async (c) => {
         postalCode: postalCode || null,
         country: country || null
       },
-      status: "assigned",
+      productInformation: {
+        inverterModel: inverterModel || null,
+        inverterCapacity: inverterCapacity || null,
+        inverterConnectionType: inverterConnectionType || null,
+        inverterBrand: inverterBrand || null,
+        solarPanelType: solarPanelType || null,
+        solarPanelBrand: solarPanelBrand || null,
+        noOfPanels: noOfPanels || null,
+        cableRequirements: cableRequirements || null,
+        acCable: acCable || null,
+        dcCable: dcCable || null,
+        earthingCable: earthingCable || null,
+        additionalMaterialReq: additionalMaterialReq || null,
+        requiredAdditionalMaterial: requiredAdditionalMaterial || null,
+        additionalMaterialCost: additionalMaterialCost || null
+      },
+      status: "Installation Assigned",
       updatedAt: new Date()
     };
 
@@ -294,5 +333,313 @@ export const getInstallerInstallations = async (c) => {
   } catch (err) {
     console.error("❌ Fetch Installer Dashboard Exception:", err.message);
     return c.json({ error: "Failed to pull installer task workspace" }, 500);
+  }
+};
+
+
+export const updateInstallationStatus = async (c) => {
+  try {
+    const body = await c.req.json();
+    const { id, status } = body;
+
+    // 1. Parameter Validation
+    if (!id || !status) {
+      return c.json(
+        { error: "Validation Error: Missing required fields 'id' or 'status'." },
+        400
+      );
+    }
+
+    // Standardize input string for robust comparison matching
+    const normalizedStatus = status.toLowerCase().trim().replace(/[\s_-]+/g, "");
+
+    // 2. Exact Mapping to Zoho's case-sensitive dropdown configurations
+    let zohoValue = null;
+    let localCleanedStatus = null;
+
+    if (normalizedStatus === "installationassigned" || normalizedStatus === "assigned") {
+      zohoValue = "Installation Assigned";
+      localCleanedStatus = "Installation Assigned";
+    } else if (
+      normalizedStatus === "engineerreachessite" ||
+      normalizedStatus === "reachedsite" ||
+      normalizedStatus === "reached"
+    ) {
+      zohoValue = "Engineer Reaches Site";
+      localCleanedStatus = "Engineer Reaches Site";
+    } else if (
+      normalizedStatus === "materialverification" ||
+      normalizedStatus === "verified"
+    ) {
+      zohoValue = "Material Verification";
+      localCleanedStatus = "Material Verification";
+    } else if (normalizedStatus === "installationstart" || normalizedStatus === "start") {
+      zohoValue = "Installation Start";
+      localCleanedStatus = "Installation Start";
+    } else if (
+      normalizedStatus === "installationprogress" ||
+      normalizedStatus === "inprogress" ||
+      normalizedStatus === "progress"
+    ) {
+      zohoValue = "Installation Progress";
+      localCleanedStatus = "Installation Progress";
+    } else if (
+      normalizedStatus === "installationcompleted" ||
+      normalizedStatus === "completed"
+    ) {
+      zohoValue = "Installation Completed";
+      localCleanedStatus = "Installation Completed";
+    }
+
+    // Fallback if the requested value doesn't match available options
+    if (!zohoValue) {
+      return c.json(
+        {
+          error: `Validation Error: '${status}' is not recognized. Must be one of: Installation Assigned, Engineer Reaches Site, Material Verification, Installation Start, Installation Progress, Installation Completed`
+        },
+        400
+      );
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      // 🔐 Grab active authorization credentials dynamically
+      const zohoToken = await getZohoAccessToken(db);
+
+      // 3. Build the precise Zoho payload
+      const zohoPayload = {
+        data: [
+          {
+            id: String(id),
+            Installation_Status: zohoValue
+          }
+        ]
+      };
+
+      console.log(
+        `📡 Transmitting Targeted Dropdown Update to Zoho CRM Installation for record ID: ${id} -> Value: ${zohoValue}...`
+      );
+
+      // 4. Update Remote Zoho CRM
+      const response = await fetch(`https://www.zohoapis.in/crm/v8/Installation/${id}`, {
+        method: "PUT",
+        headers: {
+          Authorization: `Zoho-oauthtoken ${zohoToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(zohoPayload)
+      });
+
+      if (!response.ok) {
+        const errTxt = await response.text();
+        console.error("❌ Zoho Dropdown Update execution failed:", errTxt);
+        return c.json(
+          { error: "Failed to update record state on Zoho.", details: errTxt },
+          500
+        );
+      }
+
+      const result = await response.json();
+      console.log("✅ Zoho Server Response Status Payload:", JSON.stringify(result));
+
+      // 5. 🔄 UNIFIED STEP: Sync straight to local MongoDB "installation" collection
+      console.log(
+        `🔄 Syncing local status for Installation [${id}] to matching state: ${localCleanedStatus}`
+      );
+
+      const localResult = await db.collection("installation").updateOne(
+        { zohoId: String(id) },
+        {
+          $set: {
+            status: localCleanedStatus,
+            updatedAt: new Date()
+          }
+        }
+      );
+
+      if (localResult.matchedCount === 0) {
+        console.warn(
+          `⚠️ Remote Zoho target updated, but no matching local record tracked for Installation ID: ${id}`
+        );
+      } else {
+        console.log(
+          `✅ Successfully shifted status locally for Installation [${id}] to: ${localCleanedStatus}`
+        );
+      }
+
+      return c.json({
+        success: true,
+        message: `Installation Status successfully transitioned to '${zohoValue}' inside both Zoho and local database.`,
+        id: id,
+        currentLocalStatus: localCleanedStatus
+      });
+    });
+  } catch (err) {
+    console.error("❌ Dropdown Update Exception Error:", err.message);
+    return c.json({ error: "Internal server error" }, 500);
+  }
+};
+
+
+export const updateInstallationDetails = async (c) => {
+  try {
+    const contentType = c.req.header("content-type") || "";
+    let id = null;
+    let fieldsToUpdate = {};
+    const photoFiles = [];
+
+    // 1. Parse Multipart (FormData with files & fields) or JSON Body
+    if (contentType.includes("multipart/form-data")) {
+      const body = await c.req.parseBody({ all: true });
+      id = body.id;
+
+      // Extract raw files and structured field updates
+      for (const [key, val] of Object.entries(body)) {
+        if (key === "id") continue;
+
+        // Collect uploaded photos/files
+        if (val instanceof File || (Array.isArray(val) && val[0] instanceof File)) {
+          const filesArr = Array.isArray(val) ? val : [val];
+          filesArr.forEach((file) => photoFiles.push({ fieldName: key, file }));
+        } else {
+          // If fields are passed as a JSON string under a "fields" or "data" key
+          if (key === "fields" || key === "data") {
+            try {
+              Object.assign(fieldsToUpdate, JSON.parse(val));
+            } catch {
+              fieldsToUpdate[key] = val;
+            }
+          } else {
+            fieldsToUpdate[key] = val;
+          }
+        }
+      }
+    } else {
+      // Standard JSON request
+      const body = await c.req.json();
+      id = body.id;
+      const { fields, ...rest } = body;
+      fieldsToUpdate = fields ? { ...fields } : { ...rest };
+    }
+
+    // 2. Validate Target Record ID
+    if (!id) {
+      return c.json({ error: "Validation Error: Missing required 'id' (Zoho Installation ID)." }, 400);
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      // 🔐 Grab active Zoho OAuth access token
+      const zohoToken = await getZohoAccessToken(db);
+      const zohoHeaders = {
+        Authorization: `Zoho-oauthtoken ${zohoToken}`
+      };
+
+      let zohoUpdateResult = null;
+      const uploadedAttachments = [];
+
+      // 3. Update Dynamic Zoho CRM Fields (if any are supplied)
+      if (Object.keys(fieldsToUpdate).length > 0) {
+        const zohoPayload = {
+          data: [
+            {
+              id: String(id),
+              ...fieldsToUpdate
+            }
+          ]
+        };
+
+        console.log(`📡 Sending dynamic field updates to Zoho Installation [${id}]:`, fieldsToUpdate);
+
+        const updateRes = await fetch(`https://www.zohoapis.in/crm/v8/Installation/${id}`, {
+          method: "PUT",
+          headers: {
+            ...zohoHeaders,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(zohoPayload)
+        });
+
+        if (!updateRes.ok) {
+          const errTxt = await updateRes.text();
+          console.error(`❌ Zoho Installation details update failed [${id}]:`, errTxt);
+          return c.json({ error: "Failed to update fields on Zoho CRM", details: errTxt }, 500);
+        }
+
+        zohoUpdateResult = await updateRes.json();
+      }
+
+      // 4. Upload Attached Photos directly to Zoho CRM record attachments
+      if (photoFiles.length > 0) {
+        console.log(`📸 Uploading ${photoFiles.length} file(s) for Installation [${id}]...`);
+
+        for (const item of photoFiles) {
+          const formData = new FormData();
+          formData.append("file", item.file, item.file.name || `${item.fieldName}.jpg`);
+
+          const uploadRes = await fetch(
+            `https://www.zohoapis.in/crm/v8/Installation/${id}/Attachments`,
+            {
+              method: "POST",
+              headers: zohoHeaders, // FormData sets boundary automatically
+              body: formData
+            }
+          );
+
+          if (uploadRes.ok) {
+            const uploadJson = await uploadRes.json();
+            uploadedAttachments.push({
+              field: item.fieldName,
+              fileName: item.file.name,
+              zohoAttachment: uploadJson.data?.[0] || null
+            });
+          } else {
+            const uploadErr = await uploadRes.text();
+            console.error(`⚠️ Failed to attach ${item.fieldName} for [${id}]:`, uploadErr);
+          }
+        }
+      }
+
+      // 5. Sync the updated fields locally in MongoDB
+      const mongoSetUpdates = {
+        updatedAt: new Date()
+      };
+
+      for (const [k, v] of Object.entries(fieldsToUpdate)) {
+        // Keeps the local schema aligned with whatever Zoho fields changed
+        mongoSetUpdates[`zohoFields.${k}`] = v;
+      }
+
+      if (fieldsToUpdate.Status || fieldsToUpdate.Installation_Status) {
+        mongoSetUpdates.status = fieldsToUpdate.Status || fieldsToUpdate.Installation_Status;
+      }
+
+      const mongoUpdateQuery = {
+        $set: mongoSetUpdates
+      };
+
+      if (uploadedAttachments.length > 0) {
+        mongoUpdateQuery.$push = {
+          attachments: { $each: uploadedAttachments }
+        };
+      }
+
+      await db.collection("installation").updateOne(
+        { zohoId: String(id) },
+        mongoUpdateQuery
+      );
+
+      console.log(`✅ Successfully synced dynamic fields & media for Installation [${id}]`);
+
+      return c.json({
+        success: true,
+        message: "Installation details and photos successfully updated",
+        id,
+        updatedFields: fieldsToUpdate,
+        attachmentsUploaded: uploadedAttachments.length
+      }, 200);
+    });
+
+  } catch (err) {
+    console.error("❌ Update Installation Details Exception:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
   }
 };
