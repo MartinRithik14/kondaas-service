@@ -89,7 +89,8 @@ app.use("*", async (c, next) => {
     path === '/order/zoho-deal-created' ||
     path === '/order/webhook'||
     path==='/logistic/dispatch-webhook'||
-    path === '/notification/feedback'
+    path === '/notification/feedback' ||
+    path=== '/installer/assign'
   ) && method === 'POST';
 
   if (isMetrics || isCrashLogger || isUserOnboarding || isWebhook) {
