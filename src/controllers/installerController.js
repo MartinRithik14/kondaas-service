@@ -1,4 +1,4 @@
-import { withDatabase } from '../utils/config.js'; 
+import { withDatabase } from '../utils/config.js';
 import { getZohoAccessToken } from '../utils/zohoAuth.js';
 
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -479,132 +479,143 @@ export const updateInstallationStatus = async (c) => {
   }
 };
 
-
 export const updateInstallationDetails = async (c) => {
   try {
     const contentType = c.req.header("content-type") || "";
     let id = null;
-    let fieldsToUpdate = {};
-    const photoFiles = [];
+    const fieldsToUpdate = {};
+    const photoUploads = [];
 
-    // 1. Parse Multipart (FormData with files & fields) or JSON Body
+    // Helper to detect multipart binary files
+    const isFileObject = (val) => {
+      if (!val) return false;
+      return (
+        val instanceof File ||
+        (typeof val === "object" && typeof val.arrayBuffer === "function") ||
+        (typeof val === "object" && val.name && val.type && typeof val.size === "number")
+      );
+    };
+
+    // 1. Parse incoming Multipart or JSON
     if (contentType.includes("multipart/form-data")) {
       const body = await c.req.parseBody({ all: true });
       id = body.id;
 
-      // Extract raw files and structured field updates
       for (const [key, val] of Object.entries(body)) {
         if (key === "id") continue;
 
-        // Collect uploaded photos/files
-        if (val instanceof File || (Array.isArray(val) && val[0] instanceof File)) {
-          const filesArr = Array.isArray(val) ? val : [val];
-          filesArr.forEach((file) => photoFiles.push({ fieldName: key, file }));
+        const values = Array.isArray(val) ? val : [val];
+        const files = values.filter(isFileObject);
+
+        if (files.length > 0) {
+          files.forEach((file) => {
+            photoUploads.push({ fieldApiName: key, file });
+          });
         } else {
-          // If fields are passed as a JSON string under a "fields" or "data" key
+          const rawVal = Array.isArray(val) ? val[0] : val;
           if (key === "fields" || key === "data") {
             try {
-              Object.assign(fieldsToUpdate, JSON.parse(val));
+              Object.assign(fieldsToUpdate, JSON.parse(rawVal));
             } catch {
-              fieldsToUpdate[key] = val;
+              fieldsToUpdate[key] = rawVal;
             }
           } else {
-            fieldsToUpdate[key] = val;
+            fieldsToUpdate[key] = rawVal;
           }
         }
       }
     } else {
-      // Standard JSON request
       const body = await c.req.json();
       id = body.id;
       const { fields, ...rest } = body;
-      fieldsToUpdate = fields ? { ...fields } : { ...rest };
+      Object.assign(fieldsToUpdate, fields ? fields : rest);
     }
 
-    // 2. Validate Target Record ID
     if (!id) {
       return c.json({ error: "Validation Error: Missing required 'id' (Zoho Installation ID)." }, 400);
     }
 
     return await withDatabase(MONGODB_URI, async (db) => {
-      // 🔐 Grab active Zoho OAuth access token
       const zohoToken = await getZohoAccessToken(db);
       const zohoHeaders = {
         Authorization: `Zoho-oauthtoken ${zohoToken}`
       };
 
-      let zohoUpdateResult = null;
-      const uploadedAttachments = [];
+      const uploadedImages = [];
 
-      // 3. Update Dynamic Zoho CRM Fields (if any are supplied)
+      // 2. Upload each photo to Zoho Files API (ZFS)
+      for (const item of photoUploads) {
+        const arrayBuffer = await item.file.arrayBuffer();
+        const fileBlob = new Blob([arrayBuffer], { type: item.file.type || "image/jpeg" });
+
+        const fileFormData = new FormData();
+        fileFormData.append("file", fileBlob, item.file.name || `${item.fieldApiName}.jpg`);
+
+        const fileUploadRes = await fetch("https://www.zohoapis.in/crm/v8/files", {
+          method: "POST",
+          headers: zohoHeaders,
+          body: fileFormData
+        });
+
+        if (fileUploadRes.ok) {
+          const fileResJson = await fileUploadRes.json();
+          const fileId = fileResJson.data?.[0]?.details?.id;
+
+          if (fileId) {
+            fieldsToUpdate[item.fieldApiName] = [
+              {
+                File_Id__s: fileId
+              }
+            ];
+
+            uploadedImages.push({
+              field: item.fieldApiName,
+              fileId: fileId,
+              fileName: item.file.name
+            });
+          } else {
+            console.warn(`⚠️ No file ID returned for ${item.fieldApiName}:`, fileResJson);
+          }
+        } else {
+          const fileErr = await fileUploadRes.text();
+          console.error(`❌ Zoho Files API Upload Failed for ${item.fieldApiName}:`, fileErr);
+        }
+      }
+
+      // 3. Update the Zoho CRM Record with text fields and mapped file_ids
       if (Object.keys(fieldsToUpdate).length > 0) {
-        const zohoPayload = {
-          data: [
-            {
-              id: String(id),
-              ...fieldsToUpdate
-            }
-          ]
-        };
-
-        console.log(`📡 Sending dynamic field updates to Zoho Installation [${id}]:`, fieldsToUpdate);
-
         const updateRes = await fetch(`https://www.zohoapis.in/crm/v8/Installation/${id}`, {
           method: "PUT",
           headers: {
             ...zohoHeaders,
             "Content-Type": "application/json"
           },
-          body: JSON.stringify(zohoPayload)
+          body: JSON.stringify({
+            data: [
+              {
+                id: String(id),
+                ...fieldsToUpdate
+              }
+            ]
+          })
         });
 
-        if (!updateRes.ok) {
-          const errTxt = await updateRes.text();
-          console.error(`❌ Zoho Installation details update failed [${id}]:`, errTxt);
-          return c.json({ error: "Failed to update fields on Zoho CRM", details: errTxt }, 500);
-        }
+        const updateJson = await updateRes.json();
 
-        zohoUpdateResult = await updateRes.json();
-      }
-
-      // 4. Upload Attached Photos directly to Zoho CRM record attachments
-      if (photoFiles.length > 0) {
-        console.log(`📸 Uploading ${photoFiles.length} file(s) for Installation [${id}]...`);
-
-        for (const item of photoFiles) {
-          const formData = new FormData();
-          formData.append("file", item.file, item.file.name || `${item.fieldName}.jpg`);
-
-          const uploadRes = await fetch(
-            `https://www.zohoapis.in/crm/v8/Installation/${id}/Attachments`,
-            {
-              method: "POST",
-              headers: zohoHeaders, // FormData sets boundary automatically
-              body: formData
-            }
-          );
-
-          if (uploadRes.ok) {
-            const uploadJson = await uploadRes.json();
-            uploadedAttachments.push({
-              field: item.fieldName,
-              fileName: item.file.name,
-              zohoAttachment: uploadJson.data?.[0] || null
-            });
-          } else {
-            const uploadErr = await uploadRes.text();
-            console.error(`⚠️ Failed to attach ${item.fieldName} for [${id}]:`, uploadErr);
-          }
+        if (!updateRes.ok || updateJson.data?.[0]?.status === "error") {
+          console.error(`❌ Zoho Installation update rejected for [${id}]:`, updateJson);
+          return c.json({ error: "Failed to update record fields on Zoho CRM", details: updateJson }, 500);
         }
       }
 
-      // 5. Sync the updated fields locally in MongoDB
+      const timestamp = new Date();
+
+      // 4. Update MongoDB Document Locally
       const mongoSetUpdates = {
-        updatedAt: new Date()
+        updatedAt: timestamp
       };
 
       for (const [k, v] of Object.entries(fieldsToUpdate)) {
-        // Keeps the local schema aligned with whatever Zoho fields changed
         mongoSetUpdates[`zohoFields.${k}`] = v;
       }
 
@@ -616,25 +627,34 @@ export const updateInstallationDetails = async (c) => {
         $set: mongoSetUpdates
       };
 
-      if (uploadedAttachments.length > 0) {
+      if (uploadedImages.length > 0) {
         mongoUpdateQuery.$push = {
-          attachments: { $each: uploadedAttachments }
+          uploadedPhotos: { $each: uploadedImages }
         };
       }
 
-      await db.collection("installation").updateOne(
-        { zohoId: String(id) },
-        mongoUpdateQuery
-      );
-
-      console.log(`✅ Successfully synced dynamic fields & media for Installation [${id}]`);
+      // 5. Concurrently sync 'installation' and log to 'installation-forms'
+      await Promise.all([
+        db.collection("installation").updateOne(
+          { zohoId: String(id) },
+          mongoUpdateQuery
+        ),
+        db.collection("installation-forms").insertOne({
+          installationId: String(id),
+          zohoId: String(id),
+          formData: fieldsToUpdate,
+          uploadedPhotos: uploadedImages,
+          submittedAt: timestamp,
+          createdAt: timestamp
+        })
+      ]);
 
       return c.json({
         success: true,
-        message: "Installation details and photos successfully updated",
+        message: "Installation fields, photos, and form records processed successfully",
         id,
         updatedFields: fieldsToUpdate,
-        attachmentsUploaded: uploadedAttachments.length
+        photosUploaded: uploadedImages
       }, 200);
     });
 
