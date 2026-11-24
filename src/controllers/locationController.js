@@ -192,6 +192,7 @@ export const saveDealDistance = async (c) => {
       deal_name,
       mobile,
       surveyor_name,
+      type, // Pass "installation" for multi-day installation tracking
       // Existing mobile-calculated fields preserved as before
       to_home,
       to_office,
@@ -239,14 +240,12 @@ export const saveDealDistance = async (c) => {
       resolvedSiteLng
     );
 
-    // 3. Build MongoDB document
-    const distanceData = {
-      deal_id,
-      deal_name,
-      mobile,
-      state,
-      to_site: calculatedToSiteKm, // Server-calculated km
-      surveyor_name,
+    const isInstallation = type && String(type).toLowerCase() === "installation";
+    const timestamp = new Date();
+
+    const currentTrip = {
+      date: timestamp,
+      to_site: calculatedToSiteKm,
       start_location: {
         latitude: Number(resolvedStartLat),
         longitude: Number(resolvedStartLng)
@@ -254,32 +253,113 @@ export const saveDealDistance = async (c) => {
       site_location: {
         latitude: Number(resolvedSiteLat),
         longitude: Number(resolvedSiteLng)
-      },
-      createdAt: new Date()
+      }
     };
 
-    // 4. Attach legacy mobile-computed distances untouched if supplied
     if (to_home !== undefined && to_home !== null) {
-      distanceData.to_home = to_home;
+      currentTrip.to_home = to_home;
     }
-
     if (to_office !== undefined && to_office !== null) {
-      distanceData.to_office = to_office;
+      currentTrip.to_office = to_office;
     }
 
-    // 5. Database persistence
     return await withDatabase(MONGODB_URI, async (db) => {
       const collection = db.collection("deal_distance");
 
-      // Verify no duplicate record exists
       const existingRecord = await collection.findOne({ deal_id });
-      if (existingRecord) {
-        return c.json({ error: "A distance record for this deal_id already exists!" }, 409);
+
+      // --- Surveyor Flow: Maintain strict single-record rule ---
+      if (!isInstallation) {
+        if (existingRecord) {
+          return c.json({ error: "A distance record for this deal_id already exists!" }, 409);
+        }
+
+        const distanceData = {
+          deal_id,
+          deal_name,
+          mobile,
+          state,
+          to_site: calculatedToSiteKm,
+          surveyor_name,
+          start_location: currentTrip.start_location,
+          site_location: currentTrip.site_location,
+          createdAt: timestamp
+        };
+
+        if (to_home !== undefined && to_home !== null) distanceData.to_home = to_home;
+        if (to_office !== undefined && to_office !== null) distanceData.to_office = to_office;
+
+        await collection.insertOne(distanceData);
+        return c.json({ message: "Deal distance saved successfully" }, 201);
       }
 
-      await collection.insertOne(distanceData);
+      // --- Installation Flow: Cumulative & Multi-Day Trip Tracking ---
+      if (!existingRecord) {
+        // Day 1: Create the initial tracking document
+        const initialInstallationData = {
+          deal_id,
+          type: "installation",
+          deal_name,
+          mobile,
+          state,
+          surveyor_name, // Engineer name
+          to_site: calculatedToSiteKm,
+          total_to_site: calculatedToSiteKm,
+          trip_count: 1,
+          start_location: currentTrip.start_location,
+          site_location: currentTrip.site_location,
+          trips: [{ trip_number: 1, ...currentTrip }],
+          createdAt: timestamp,
+          updatedAt: timestamp
+        };
 
-      return c.json({ message: "Deal distance saved successfully" }, 201);
+        if (to_home !== undefined && to_home !== null) initialInstallationData.to_home = to_home;
+        if (to_office !== undefined && to_office !== null) initialInstallationData.to_office = to_office;
+
+        await collection.insertOne(initialInstallationData);
+
+        return c.json({
+          message: "Installation distance initialized (Day 1)",
+          trip_number: 1,
+          day_to_site: calculatedToSiteKm,
+          total_to_site: calculatedToSiteKm
+        }, 201);
+      } else {
+        // Day 2+: Increment distance and push new trip
+        const nextTripNumber = (existingRecord.trips?.length || existingRecord.trip_count || 1) + 1;
+
+        const updateFields = {
+          updatedAt: timestamp,
+          start_location: currentTrip.start_location,
+          site_location: currentTrip.site_location
+        };
+
+        if (to_home !== undefined && to_home !== null) updateFields.to_home = to_home;
+        if (to_office !== undefined && to_office !== null) updateFields.to_office = to_office;
+
+        const updateOps = {
+          $inc: {
+            to_site: calculatedToSiteKm,
+            total_to_site: calculatedToSiteKm,
+            trip_count: 1
+          },
+          $set: updateFields,
+          $push: {
+            trips: { trip_number: nextTripNumber, ...currentTrip }
+          }
+        };
+
+        await collection.updateOne({ deal_id }, updateOps);
+
+        const newTotal = (existingRecord.total_to_site || existingRecord.to_site || 0) + calculatedToSiteKm;
+
+        return c.json({
+          message: `Installation distance added (Day ${nextTripNumber})`,
+          trip_number: nextTripNumber,
+          day_to_site: calculatedToSiteKm,
+          total_to_site: Number(newTotal.toFixed(2))
+        }, 200);
+      }
     });
   } catch (err) {
     console.error("❌ saveDealDistance execution failed:", err.message);
