@@ -1,5 +1,6 @@
-import { withDatabase } from '../utils/config.js';
+import { withDatabase,Binary } from '../utils/config.js';
 import { getZohoAccessToken } from '../utils/zohoAuth.js';
+import { processWhatsAppNotification } from './notificationController.js';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
@@ -257,7 +258,7 @@ export const installationWebhook = async (c) => {
         requiredAdditionalMaterial: requiredAdditionalMaterial || null,
         additionalMaterialCost: additionalMaterialCost || null
       },
-      status: "Installation Assigned",
+      status: "assigned",
       updatedAt: new Date()
     };
 
@@ -399,6 +400,12 @@ export const updateInstallationStatus = async (c) => {
     ) {
       zohoValue = "Installation Progress";
       localCleanedStatus = "Installation Progress";
+    } else if (
+      normalizedStatus === "accepted" ||
+      normalizedStatus === "Accepted"
+    ) {
+      zohoValue = "Accepted";
+      localCleanedStatus = "Accepted";
     } else if (
       normalizedStatus === "installationcompleted" ||
       normalizedStatus === "completed"
@@ -926,6 +933,191 @@ export const installationCheckIn = async (c) => {
 
   } catch (err) {
     console.error("❌ Installation Check-In Exception:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
+  }
+};
+
+
+export const rejectInstallation = async (c) => {
+  try {
+    const body = await c.req.json();
+    const { id, installationId, installerMobile, reason, remarks } = body;
+
+    const rawId = id || installationId;
+
+    if (!rawId) {
+      return c.json({ error: "Missing required parameter: 'id' or 'installationId'" }, 400);
+    }
+
+    if (!reason || !String(reason).trim()) {
+      return c.json({ error: "Missing required parameter: 'reason'" }, 400);
+    }
+
+    const timestamp = new Date();
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      // 1. Locate the installation document
+      const existingDoc = await db.collection("installation").findOne({
+        $or: [
+          { zohoId: String(rawId) },
+          { installationId: String(rawId) }
+        ]
+      });
+
+      if (!existingDoc) {
+        return c.json({ error: `Installation record not found for '${rawId}'` }, 404);
+      }
+
+      const zohoId = existingDoc.zohoId;
+      const resolvedInstallationId = existingDoc.installationId || rawId;
+      const rejectingInstaller = installerMobile || existingDoc.assignedTo || null;
+
+      // 2. Insert detailed record into 'installation-rejections'
+      const rejectionDoc = {
+        installationObjectId: existingDoc._id,
+        zohoId: String(zohoId),
+        installationId: resolvedInstallationId,
+        rejectedBy: rejectingInstaller,
+        reason: String(reason).trim(),
+        remarks: remarks ? String(remarks).trim() : null,
+        rejectedAt: timestamp,
+        createdAt: timestamp
+      };
+
+      const rejectionInsert = await db.collection("installation-rejections").insertOne(rejectionDoc);
+
+      // 3. Update 'installation' by pushing ONLY the generated ObjectId reference
+      await db.collection("installation").updateOne(
+        { _id: existingDoc._id },
+        {
+          $set: {
+            status: "Installation Rejected",
+            assignedTo: null,
+            installerMobile: null,
+            installerNumber: null,
+            updatedAt: timestamp
+          },
+          $push: {
+            rejectionIds: rejectionInsert.insertedId // Just the ObjectId reference
+          }
+        }
+      );
+
+      return c.json({
+        success: true,
+        message: "Installation marked as rejected and unassigned successfully",
+        zohoId,
+        rejectionId: rejectionInsert.insertedId
+      }, 200);
+    });
+  } catch (err) {
+    console.error("❌ Reject Installation Exception:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
+  }
+};
+
+
+export const triggerInstallationNotification = async (c) => {
+  try {
+    const {
+      installationId,
+      zohoId,
+      installerNumber,
+      customerMobile,
+      name,
+      scenarioType,
+      eta
+    } = await c.req.json();
+
+    const numericScenario = Number(scenarioType);
+
+    if (![1, 2, 3].includes(numericScenario)) {
+      return c.json(
+        { error: `Invalid scenarioType: ${scenarioType}. Supported scenarios are 1, 2, and 3.` },
+        400
+      );
+    }
+
+    let cleanedCustomerMobile = customerMobile
+      ? String(customerMobile).replace(/\D/g, "")
+      : null;
+
+    if (
+      cleanedCustomerMobile &&
+      cleanedCustomerMobile.length === 12 &&
+      cleanedCustomerMobile.startsWith("91")
+    ) {
+      cleanedCustomerMobile = cleanedCustomerMobile.substring(2);
+    }
+
+    if (!cleanedCustomerMobile || cleanedCustomerMobile.length !== 10) {
+      return c.json({ error: "Invalid or missing customerMobile." }, 400);
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      const customerName = name || "Customer";
+
+      // Fallback text content for logging/audit
+      const messages = {
+        1: `Hello ${customerName}, your Kondaas solar installation technician has started their journey to your location. Expected arrival in ${eta || "30"} minutes. You can reach them at ${installerNumber || ""} for any assistance.`,
+        2: `Hello ${customerName}, your Kondaas solar installation technician has arrived at your location.`,
+        3: `Hello ${customerName}, your Kondaas solar installation work has been completed. Thank you for your cooperation! Please rate your experience below.`
+      };
+
+      // Interakt template mappings
+      const interaktTemplates = {
+        1: {
+          templateName: "installer_started",
+          bodyValues: [String(customerName), String(eta || "30"), String(installerNumber || "")]
+        },
+        2: {
+          templateName: "installer_arrived",
+          bodyValues: [String(customerName)]
+        },
+        3: {
+          templateName: "installation_feedback_rating",
+          bodyValues: [String(customerName)]
+        }
+      };
+
+      const selectedTemplate = interaktTemplates[numericScenario];
+
+      const notificationDoc = {
+        from: "Kondaas_System",
+        to: cleanedCustomerMobile,
+        mode: "whatsapp",
+        context: "installation",
+        installationId: installationId || null,
+        zohoId: zohoId ? String(zohoId) : null,
+        customerName,
+        scenarioType: numericScenario,
+        content: new Binary(Buffer.from(messages[numericScenario], "utf8")),
+        contentType: numericScenario === 3 ? "poll" : "text",
+        templateName: selectedTemplate.templateName,
+        bodyValues: selectedTemplate.bodyValues,
+        status: "pending",
+        createdAt: new Date()
+      };
+
+      const result = await db.collection("notifications").insertOne(notificationDoc);
+
+      // Fire-and-forget via existing Interakt worker
+      processWhatsAppNotification(result.insertedId).catch((err) =>
+        console.error("❌ Installation WhatsApp Worker Error:", err)
+      );
+
+      return c.json(
+        {
+          success: true,
+          message: `Installation notification (scenario ${numericScenario}) queued successfully.`,
+          notificationId: result.insertedId,
+          templateName: selectedTemplate.templateName
+        },
+        200
+      );
+    });
+  } catch (err) {
+    console.error("❌ Trigger Installation Notification Exception:", err.message);
     return c.json({ error: "Internal server error", details: err.message }, 500);
   }
 };

@@ -1,11 +1,13 @@
 import { Hono } from 'hono';
 
-import { addLocation,addInstallationNote,installationCheckIn,updateInstallationDetails,updateInstallationStatus,getInstallerInstallations,installationWebhook,getLocationByTime, getCurrentLocation } from '../controllers/installerController.js';
+import { addLocation,triggerInstallationNotification,rejectInstallation,addInstallationNote,installationCheckIn,updateInstallationDetails,updateInstallationStatus,getInstallerInstallations,installationWebhook,getLocationByTime, getCurrentLocation } from '../controllers/installerController.js';
 
 const installerRoutes = new Hono();
 
 installerRoutes.post('/add', addLocation);
 installerRoutes.post('/notes', addInstallationNote);
+installerRoutes.post('/notification', triggerInstallationNotification);
+installerRoutes.post('/reject', rejectInstallation);
 installerRoutes.post('/check-in', installationCheckIn);
 
 installerRoutes.put('/form', updateInstallationDetails);

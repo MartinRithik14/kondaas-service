@@ -76,30 +76,7 @@ app.use("*", auditHttpMiddleware);
 app.use("*", metricsMiddleware);
 
 // 2. 🛡️ Global Auth Gatekeeper Middleware
-app.use("*", async (c, next) => {
-  const path = c.req.path;
-  const method = c.req.method;
 
-  // Exact public endpoints permitted without internal session headers:
-  const isMetrics = (path === '/metrics' || path === '/metrics/') && method === 'GET';
-  const isCrashLogger = (path === '/crash/add' || path.startsWith('/crash')) && method === 'POST';
-  const isUserOnboarding = path === '/solarman/user' && method === 'POST';
-  const isWebhook = (
-    path === '/order/zoho-assign' ||
-    path === '/order/zoho-deal-created' ||
-    path === '/order/webhook'||
-    path==='/logistic/dispatch-webhook'||
-    path === '/notification/feedback' ||
-    path=== '/installer/assign'
-  ) && method === 'POST';
-
-  if (isMetrics || isCrashLogger || isUserOnboarding || isWebhook) {
-    return next();
-  }
-
-  // Enforce MongoDB session verification on everything else
-  return requireAuth(c, next);
-});
 
 // 3. Application Routes
 app.route('/location', locationRoutes);
