@@ -90,7 +90,8 @@ app.use("*", async (c, next) => {
     path === '/order/webhook'||
     path==='/logistic/dispatch-webhook'||
     path === '/notification/feedback' ||
-    path=== '/installer/assign'
+    path=== '/installer/assign'||
+    path === '/notification/interakt-webhook'
   ) && method === 'POST';
 
   if (isMetrics || isCrashLogger || isUserOnboarding || isWebhook) {
