@@ -1,7 +1,7 @@
 import { withDatabase, Binary, ObjectId, getSystemKeys } from '../utils/config.js';
 import { generatePDF } from '../utils/pdfGenerator.js';
 import { getZohoAccessToken } from '../utils/zohoAuth.js';
-import { uploadToZohoWorkDrive, uploadSurveyorAttendancePhoto, getOrCreateLeadsSEFolder,createZohoPublicDownloadUrl } from '../utils/uploadToZohoWorkDrive.js';
+import { uploadToZohoWorkDrive, uploadSurveyorAttendancePhoto, getOrCreateLeadsSEFolder, createZohoPublicDownloadUrl } from '../utils/uploadToZohoWorkDrive.js';
 import { getInvoiceTemplate, getSurveyReportTemplate } from '../templates/invoiceTemplate.js';
 import path from 'path';
 import fs from 'fs';
@@ -41,7 +41,7 @@ const sendViaInterakt = async ({ interaktConfig, to, templateName, bodyValues = 
     type: "Template",
     template: {
       name: templateName,
-      
+
       languageCode: languageCode, // Try "en_US" if "en" fails after sync
       bodyValues
     }
@@ -83,8 +83,8 @@ export const processWhatsAppNotification = async (notificationId) => {
 
       if (!notification) return;
 
-      const contentString = notification.content?.buffer 
-        ? notification.content.buffer.toString("utf8") 
+      const contentString = notification.content?.buffer
+        ? notification.content.buffer.toString("utf8")
         : (notification.content || "");
 
       const templateInfo = resolveInteraktTemplate(notification, contentString);
@@ -124,131 +124,184 @@ export const processWhatsAppNotification = async (notificationId) => {
   }
 };
 
-export const saveWhatsAppRating = async (c) => {
+export const handleInteraktWebhook = async (c) => {
   try {
-    // 1. Parse incoming body data via Hono's native parser
-    const body = await c.req.json();
-    const { mobile, rating, feedback } = body;
+    const payload = await c.req.json();
+    console.log("🔔 RAW INTERAKT WEBHOOK:", JSON.stringify(payload));
 
-    // 2. Structural data validation check
-    // Mobile is mandatory, and we must receive at least a rating OR feedback to do an update
-    if (!mobile || (rating === undefined && feedback === undefined)) {
-      return c.json({
-        success: false,
-        message: "Missing required fields: mobile and either rating or feedback are mandatory.",
-      }, 400);
+    // 1. Only process API template button clicks
+    if (payload?.type !== "message_api_clicked") {
+      return c.json({ success: true, ignored: true }, 200);
     }
 
+    const rawPhone =
+      payload?.data?.customer?.phone_number ||
+      payload?.data?.customer?.channel_phone_number;
+
+    const replyText = (
+      payload?.data?.message?.button_text ||
+      payload?.data?.message?.button_payload?.payload?.text
+    )?.trim();
+
+    if (!rawPhone || !replyText) {
+      return c.json({ success: true, ignored: true, reason: "Missing phone or button text" }, 200);
+    }
+
+    // 2. Parse template name directly from raw_template
+    let templateName = null;
+    try {
+      if (payload?.data?.message?.raw_template) {
+        const parsedTemplate = JSON.parse(payload.data.message.raw_template);
+        templateName = parsedTemplate?.name || parsedTemplate?.display_name || null;
+      }
+    } catch (parseErr) {
+      console.warn("⚠️ Could not parse raw_template:", parseErr.message);
+    }
+
+    // 3. Fast-exit guard: only handle our two rating templates and valid 1-5 ratings
+    const VALID_RATINGS = ["1", "2", "3", "4", "5"];
+    if (!VALID_RATINGS.includes(replyText)) {
+      return c.json({ success: true, ignored: true, reason: `Not a rating reply: ${replyText}` }, 200);
+    }
+
+    if (
+      templateName !== "installation_feedback_rating" &&
+      templateName !== "surveyor_feedback_rating"
+    ) {
+      return c.json({ success: true, ignored: true, reason: `Ignored template: ${templateName}` }, 200);
+    }
+
+    // Normalize to 10-digit mobile number
+    let cleanedMobile = String(rawPhone).replace(/\D/g, "");
+    if (cleanedMobile.length === 12 && cleanedMobile.startsWith("91")) {
+      cleanedMobile = cleanedMobile.substring(2);
+    }
+
+    console.log(`📩 Interakt rating [${templateName}] from ${cleanedMobile}: "${replyText}"`);
+
     return await withDatabase(MONGODB_URI, async (db) => {
-
-      // 🛠️ DYNAMIC UPDATE PAYLOAD: Only update what is provided to prevent overwriting existing data
-      const updateFields = {
-        ratingReceivedAt: new Date()
-      };
-
-      if (rating !== undefined && rating !== null) {
-        updateFields.rating = String(rating).trim();
-      }
-
-      if (feedback !== undefined && feedback !== null) {
-        updateFields.feedback = String(feedback).trim();
-      }
-
-   
-      const updatedDeal = await db.collection('deals').findOneAndUpdate(
-        {
-          whatsappNo: mobile.trim(),
-          siteSurveyStatus: { $in: ["Completed", "completed"] },
-          rating: { $exists: false } // excludes already-rated deals from earlier visits
-        },
-        {
-          $set: updateFields
-        },
-        {
-          sort: { completedAt: -1 }, // if multiple unrated completed deals exist, always take the newest
-          returnDocument: 'after'
-        }
-      );
-
-      // 4. Handle if no matching record is found in your database
-      if (!updatedDeal) {
-        return c.json({
-          success: false,
-          message: "No active completed survey record found matching this mobile number (or it may have already been rated).",
-        }, 404);
-      }
-
-      // 💥 ZOHO CRM INTEGRATION LAYER 💥
-      const zohoDealId = updatedDeal.deal_id;
-
-      if (!zohoDealId) {
-        console.warn(`⚠️ saved locally, but skipping Zoho update because deal_id is missing for mobile: ${mobile}`);
-        return c.json({
-          success: true,
-          message: "Rating saved locally, but no Zoho deal_id linked to this record.",
-        }, 200);
-      }
-
-      try {
-        // 🔐 Grab active authorization credentials dynamically out of RAM / config collection
-        const zohoToken = await getZohoAccessToken(db);
-
-        console.log(`📡 Syncing fields to Zoho CRM for Deal ID: ${zohoDealId}...`);
-
-        // 📝 Pull the combined current state directly from the updated database object 
-        // This ensures Zoho always gets both fields, even if they arrived across separate requests!
-        const zohoPayload = {
-          data: [
-            {
-              id: zohoDealId,
-              Rating: updatedDeal.rating || "",
-              Site_Survey_Remarks: updatedDeal.feedback || ""
-            }
-          ]
-        };
-
-        const zohoResponse = await fetch(`https://www.zohoapis.in/crm/v8/Deals`, {
-          method: "PUT",
-          headers: {
-            "Authorization": `Zoho-oauthtoken ${zohoToken}`,
-            "Content-Type": "application/json"
+      // 4. Route A: INSTALLATION rating flow
+      if (templateName === "installation_feedback_rating") {
+        const updatedInstallation = await db.collection("installation").findOneAndUpdate(
+          {
+            customerPhone: { $in: [cleanedMobile, rawPhone] },
+            status: { $in: ["Completed", "completed"] },
+            rating: { $exists: false }
           },
-          body: JSON.stringify(zohoPayload)
-        });
+          {
+            $set: {
+              rating: replyText,
+              ratingReceivedAt: new Date()
+            }
+          },
+          {
+            sort: { completedAt: -1, updatedAt: -1 },
+            returnDocument: "after"
+          }
+        );
 
-        if (!zohoResponse.ok) {
-          const errorText = await zohoResponse.text();
-          console.error(`❌ Zoho API rating sync failed for Deal ${zohoDealId}:`, errorText);
-          return c.json({
-            success: true,
-            message: "Rating saved locally, but failed to sync with Zoho CRM.",
-            deal_id: zohoDealId
-          }, 200);
+        if (!updatedInstallation) {
+          console.warn(`⚠️ No unrated completed installation found for ${cleanedMobile}`);
+          return c.json({ success: true, message: "No matching unrated installation" }, 200);
         }
 
-        const zohoResult = await zohoResponse.json();
-        console.log(`✅ Zoho CRM Sync Successful for Deal ${zohoDealId}:`, JSON.stringify(zohoResult?.data?.[0]?.status));
+        if (updatedInstallation.zohoId) {
+          try {
+            const zohoToken = await getZohoAccessToken(db);
+            const zohoResponse = await fetch(`https://www.zohoapis.in/crm/v8/Installation`, {
+              method: "PUT",
+              headers: {
+                "Authorization": `Zoho-oauthtoken ${zohoToken}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                data: [
+                  {
+                    id: updatedInstallation.zohoId,
+                    Rating: replyText
+                  }
+                ]
+              })
+            });
 
-      } catch (zohoError) {
-        console.error("❌ Exception inside Zoho CRM update transaction block:", zohoError.message);
+            if (!zohoResponse.ok) {
+              console.error(`❌ Zoho Installation sync failed:`, await zohoResponse.text());
+            } else {
+              console.log(`✅ Zoho Installation ${updatedInstallation.zohoId} updated with rating: ${replyText}`);
+            }
+          } catch (zohoErr) {
+            console.error("❌ Zoho Installation sync error:", zohoErr.message);
+          }
+        }
+
+        return c.json({ success: true, routedTo: "installation", rating: replyText }, 200);
       }
 
-      // 5. Final Success Response
-      return c.json({
-        success: true,
-        message: "Rating and feedback successfully processed and synchronized with Zoho CRM.",
-        deal_id: zohoDealId
-      }, 200);
-    });
+      // 5. Route B: SURVEYOR (Deals) rating flow
+      if (templateName === "surveyor_feedback_rating") {
+        const updatedDeal = await db.collection("deals").findOneAndUpdate(
+          {
+            whatsappNo: { $in: [cleanedMobile, rawPhone] },
+            siteSurveyStatus: { $in: ["Completed", "completed"] },
+            rating: { $exists: false }
+          },
+          {
+            $set: {
+              rating: replyText,
+              ratingReceivedAt: new Date()
+            }
+          },
+          {
+            sort: { completedAt: -1 },
+            returnDocument: "after"
+          }
+        );
 
-  } catch (error) {
-    console.error("❌ Error inside saveWhatsAppRating Hono controller:", error.message);
-    return c.json({
-      success: false,
-      message: "Internal Server Error while saving customer feedback.",
-    }, 500);
+        if (!updatedDeal) {
+          console.warn(`⚠️ No unrated completed survey deal found for ${cleanedMobile}`);
+          return c.json({ success: true, message: "No matching unrated deal" }, 200);
+        }
+
+        if (updatedDeal.deal_id) {
+          try {
+            const zohoToken = await getZohoAccessToken(db);
+            const zohoResponse = await fetch(`https://www.zohoapis.in/crm/v8/Deals`, {
+              method: "PUT",
+              headers: {
+                "Authorization": `Zoho-oauthtoken ${zohoToken}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                data: [
+                  {
+                    id: updatedDeal.deal_id,
+                    Rating: replyText
+                  }
+                ]
+              })
+            });
+
+            if (!zohoResponse.ok) {
+              console.error(`❌ Zoho Deal sync failed:`, await zohoResponse.text());
+            } else {
+              console.log(`✅ Zoho Deal ${updatedDeal.deal_id} updated with rating: ${replyText}`);
+            }
+          } catch (zohoErr) {
+            console.error("❌ Zoho Deal sync error:", zohoErr.message);
+          }
+        }
+
+        return c.json({ success: true, routedTo: "surveyor", rating: replyText }, 200);
+      }
+
+      return c.json({ success: true, ignored: true }, 200);
+    });
+  } catch (err) {
+    console.error("❌ Interakt Webhook Error:", err.message);
+    return c.json({ success: false, error: err.message }, 200);
   }
 };
+
 
 const toPreviewUrl = (url, fileId) => {
   if (!url && fileId) return `https://workdrive.zoho.in/file/${fileId}`;
